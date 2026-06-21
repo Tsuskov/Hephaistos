@@ -2,12 +2,15 @@
 //!
 //! Phase 0: project scaffold (`Config`, `matmul`).
 //! Phase 1: data & tokenizer (see `data`).
+//! Phase 2: GPT-2-style forward pass (see `model`).
 
 mod data;
+mod model;
 
 use std::path::Path;
 
 use data::{encode_ids, train_bpe, write_u16_le, DataLoader};
+use model::{Config, Gpt};
 
 const CORPUS: &str = "data/input.txt";
 const TOK_PATH: &str = "data/tokenizer.json";
@@ -17,17 +20,10 @@ const VOCAB_SIZE: usize = 1024;
 const BATCH_SIZE: usize = 4;
 const BLOCK_SIZE: usize = 64;
 
-/// Model hyperparameters. Weights live as flat `Vec<f32>` buffers shaped by these.
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // fields wired up in later phases
-pub struct Config {
-    pub n_layer: usize,
-    pub n_head: usize,
-    pub n_embd: usize,
-    pub block_size: usize,
-    pub vocab_size: usize,
-    pub batch_size: usize,
-}
+// Phase-2 demo model size (real Config arrives in Phase 8).
+const N_LAYER: usize = 4;
+const N_HEAD: usize = 4;
+const N_EMBD: usize = 128;
 
 /// Row-major matrix multiply: `out[m x n] = a[m x k] * b[k x n]`.
 ///
@@ -92,6 +88,48 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Within a row, targets are inputs shifted left by one.
     assert_eq!(&x[1..BLOCK_SIZE], &y[0..BLOCK_SIZE - 1]);
     println!("targets == inputs shifted by 1 ✓");
+
+    // Phase 2: build a GPT-2-style model and run one forward pass.
+    let cfg = Config {
+        n_layer: N_LAYER,
+        n_head: N_HEAD,
+        n_embd: N_EMBD,
+        block_size: BLOCK_SIZE,
+        vocab_size: VOCAB_SIZE,
+        batch_size: BATCH_SIZE,
+    };
+    let mut model = Gpt::new(cfg, &mut rng);
+    println!("\nmodel: {} params", model.num_params());
+    model.forward(&x);
+
+    let logits = model.logits();
+    assert_eq!(logits.len(), BATCH_SIZE * BLOCK_SIZE * VOCAB_SIZE);
+    let (mut mn, mut mx, mut sum) = (f32::INFINITY, f32::NEG_INFINITY, 0.0f64);
+    for &v in logits {
+        assert!(v.is_finite(), "logit not finite");
+        mn = mn.min(v);
+        mx = mx.max(v);
+        sum += v as f64;
+    }
+    println!(
+        "logits shape = [{BATCH_SIZE}, {BLOCK_SIZE}, {VOCAB_SIZE}] = {} values",
+        logits.len()
+    );
+    println!(
+        "logits: min {mn:.4}, max {mx:.4}, mean {:.4} (all finite ✓)",
+        sum / logits.len() as f64
+    );
+
+    // argmax over the last position of batch row 0 -> a (random, untrained) prediction
+    let last = &logits[(BLOCK_SIZE - 1) * VOCAB_SIZE..BLOCK_SIZE * VOCAB_SIZE];
+    let argmax = last
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(i, _)| i as u32)
+        .unwrap();
+    let pred = tok.decode(&[argmax], false)?;
+    println!("untrained next-token prediction (row 0): id {argmax} = {pred:?}");
 
     Ok(())
 }
