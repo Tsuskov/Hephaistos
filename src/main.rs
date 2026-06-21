@@ -3,8 +3,10 @@
 //! Phase 0: project scaffold (`Config`, `matmul`).
 //! Phase 1: data & tokenizer (see `data`).
 //! Phase 2: GPT-2-style forward pass (see `model`).
+//! Phase 4: gradient-check harness (see `gradcheck`).
 
 mod data;
+mod gradcheck;
 mod model;
 
 use std::path::Path;
@@ -134,6 +136,26 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Phase 3: untrained loss should sit near ln(vocab_size) (uniform-guess).
     let expected = (VOCAB_SIZE as f32).ln();
     println!("loss = {loss:.4}  (expected ~ln({VOCAB_SIZE}) = {expected:.4})");
+
+    // Phase 4: gradient-check harness on a mini-config, validated against the
+    // analytic softmax+CE logit gradient (the only one we can write pre-backward).
+    let mini = Config {
+        n_layer: 2,
+        n_head: 2,
+        n_embd: 16,
+        block_size: 8,
+        vocab_size: 32,
+        batch_size: 2,
+    };
+    let mut mini_model = Gpt::new(mini, &mut rng);
+    let mn = mini.batch_size * mini.block_size;
+    let ids2: Vec<u16> = (0..mn).map(|i| (i % mini.vocab_size) as u16).collect();
+    let tgt2: Vec<u16> = (0..mn).map(|i| ((i * 5 + 1) % mini.vocab_size) as u16).collect();
+
+    let max_rel = gradcheck::validate_softmax_ce(&mut mini_model, &ids2, &tgt2, 1e-3);
+    println!("\nPhase 4 harness: softmax+CE analytic vs numerical, max rel error = {max_rel:.2e}");
+    let g = gradcheck::numerical_grad(&mut mini_model, &ids2, &tgt2, 0, 1e-3);
+    println!("numerical grad of param[0] = {g:.6}  (harness ready for Phase 5)");
 
     Ok(())
 }

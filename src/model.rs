@@ -197,6 +197,16 @@ impl Gpt {
         self.params.len()
     }
 
+    /// Read a single flat parameter (used by the gradient-check harness).
+    pub fn param(&self, i: usize) -> f32 {
+        self.params[i]
+    }
+
+    /// Overwrite a single flat parameter (used by the gradient-check harness).
+    pub fn set_param(&mut self, i: usize, v: f32) {
+        self.params[i] = v;
+    }
+
     /// Logits `[B, T, V]` from the last forward pass.
     pub fn logits(&self) -> &[f32] {
         &self.acts[self.al.logits.range()]
