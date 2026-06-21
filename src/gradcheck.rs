@@ -15,16 +15,21 @@ pub fn rel_error(a: f64, b: f64) -> f64 {
     (a - b).abs() / denom
 }
 
-/// Central-difference gradient of the loss w.r.t. flat parameter `i`.
+/// Central-difference gradient of the loss w.r.t. flat parameter `i`, evaluated
+/// with the f64 forward so round-off doesn't floor the accuracy at ~1e-3.
 /// This is the workhorse Phase 5 uses to check each analytic parameter gradient.
-pub fn numerical_grad(model: &mut Gpt, ids: &[u16], targets: &[u16], i: usize, eps: f32) -> f32 {
+pub fn numerical_grad(model: &mut Gpt, ids: &[u16], targets: &[u16], i: usize, eps: f32) -> f64 {
     let orig = model.param(i);
-    model.set_param(i, orig + eps);
-    let lp = model.forward(ids, Some(targets)).unwrap();
-    model.set_param(i, orig - eps);
-    let lm = model.forward(ids, Some(targets)).unwrap();
+    // Use the actual f32 perturbation span as the denominator so the parameter's
+    // f32 granularity doesn't leak into the estimate.
+    let plus = orig + eps;
+    let minus = orig - eps;
+    model.set_param(i, plus);
+    let lp = model.loss_f64(ids, targets);
+    model.set_param(i, minus);
+    let lm = model.loss_f64(ids, targets);
     model.set_param(i, orig);
-    (lp - lm) / (2.0 * eps)
+    (lp - lm) / (plus as f64 - minus as f64)
 }
 
 /// Mean cross-entropy computed directly from a `logits [n, v]` buffer, in f64.
@@ -96,6 +101,42 @@ pub fn validate_softmax_ce(model: &mut Gpt, ids: &[u16], targets: &[u16], eps: f
     max_rel
 }
 
+/// Run forward+backward, then for each parameter tensor sample up to
+/// `per_tensor` entries and compare the analytic gradient against the f64
+/// central-difference estimate. Returns `(name, max_rel_error, n_checked)` per
+/// tensor. Entries with negligible gradient (both < 1e-8) are skipped.
+pub fn check_gradients(
+    model: &mut Gpt,
+    ids: &[u16],
+    targets: &[u16],
+    eps: f32,
+    per_tensor: usize,
+) -> Vec<(&'static str, f64, usize)> {
+    // f64 analytic gradients (formula correctness, isolated from f32 round-off).
+    let analytic = model.grads_f64(ids, targets);
+
+    let spans = model.param_spans();
+    let mut out = Vec::with_capacity(spans.len());
+    for (name, off, len) in spans {
+        let step = (len / per_tensor).max(1);
+        let mut max_rel = 0.0f64;
+        let mut checked = 0usize;
+        let mut i = 0;
+        while i < len {
+            let idx = off + i;
+            let a = analytic[idx];
+            let numeric = numerical_grad(model, ids, targets, idx, eps);
+            if a.abs().max(numeric.abs()) > 1e-8 {
+                max_rel = max_rel.max(rel_error(a, numeric));
+                checked += 1;
+            }
+            i += step;
+        }
+        out.push((name, max_rel, checked));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +166,22 @@ mod tests {
 
         let max_rel = validate_softmax_ce(&mut model, &ids, &targets, 1e-3);
         assert!(max_rel < 1e-4, "harness max rel error {max_rel} too high");
+    }
+
+    #[test]
+    fn all_param_grads_match_numerical() {
+        let cfg = mini();
+        let mut rng = StdRng::seed_from_u64(123);
+        let mut model = Gpt::new(cfg, &mut rng);
+        let n = cfg.batch_size * cfg.block_size;
+        let ids: Vec<u16> = (0..n).map(|i| ((i * 13 + 2) % cfg.vocab_size) as u16).collect();
+        let targets: Vec<u16> = (0..n).map(|i| ((i * 7 + 1) % cfg.vocab_size) as u16).collect();
+
+        let results = check_gradients(&mut model, &ids, &targets, 1e-5, 8);
+        for (name, max_rel, checked) in results {
+            assert!(checked > 0, "{name}: nothing checked");
+            assert!(max_rel < 1e-4, "{name}: max rel error {max_rel} >= 1e-4");
+        }
     }
 
     #[test]

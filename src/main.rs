@@ -154,8 +154,20 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let max_rel = gradcheck::validate_softmax_ce(&mut mini_model, &ids2, &tgt2, 1e-3);
     println!("\nPhase 4 harness: softmax+CE analytic vs numerical, max rel error = {max_rel:.2e}");
-    let g = gradcheck::numerical_grad(&mut mini_model, &ids2, &tgt2, 0, 1e-3);
-    println!("numerical grad of param[0] = {g:.6}  (harness ready for Phase 5)");
+
+    // Phase 5: full backward, every parameter tensor gradient-checked
+    // (f64 analytic vs f64 numerical). Also exercise the f32 training backward.
+    mini_model.forward(&ids2, Some(&tgt2));
+    mini_model.backward(&ids2, &tgt2);
+    let _ = mini_model.grad(0); // f32 param grads populated (used by Phase 6)
+    println!("Phase 5 gradient check (max rel error vs f64 numerical, < 1e-4 = correct):");
+    let results = gradcheck::check_gradients(&mut mini_model, &ids2, &tgt2, 1e-5, 8);
+    let mut worst = 0.0f64;
+    for (name, rel, checked) in &results {
+        println!("  {name:9} {rel:.2e}  ({checked} checked)");
+        worst = worst.max(*rel);
+    }
+    println!("worst tensor: {worst:.2e}");
 
     Ok(())
 }

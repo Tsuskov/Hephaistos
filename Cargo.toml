@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 rand = "0.8"
+num-traits = "0.2"
