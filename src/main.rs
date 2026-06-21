@@ -1,7 +1,21 @@
 //! Hephaistos — a GPT/Llama implemented from scratch in Rust.
 //!
-//! Phase 0: project scaffold. A `Config` describing the model, and a `matmul`
-//! triple-loop that everything else will be built on.
+//! Phase 0: project scaffold (`Config`, `matmul`).
+//! Phase 1: data & tokenizer (see `data`).
+
+mod data;
+
+use std::path::Path;
+
+use data::{encode_ids, train_bpe, write_u16_le, DataLoader};
+
+const CORPUS: &str = "data/input.txt";
+const TOK_PATH: &str = "data/tokenizer.json";
+const TRAIN_BIN: &str = "data/train.bin";
+const VAL_BIN: &str = "data/val.bin";
+const VOCAB_SIZE: usize = 1024;
+const BATCH_SIZE: usize = 4;
+const BLOCK_SIZE: usize = 64;
 
 /// Model hyperparameters. Weights live as flat `Vec<f32>` buffers shaped by these.
 #[derive(Debug, Clone, Copy)]
@@ -36,13 +50,50 @@ pub fn matmul(out: &mut [f32], a: &[f32], b: &[f32], m: usize, k: usize, n: usiz
     }
 }
 
-fn main() {
-    // A tiny sanity demo so `cargo run` shows something real.
-    let a = [1.0, 2.0, 3.0, 4.0]; // 2x2
-    let b = [5.0, 6.0, 7.0, 8.0]; // 2x2
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Phase 0 sanity.
     let mut out = [0.0f32; 4];
-    matmul(&mut out, &a, &b, 2, 2, 2);
-    println!("matmul([[1,2],[3,4]] x [[5,6],[7,8]]) = {out:?}");
+    matmul(&mut out, &[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0], 2, 2, 2);
+    println!("matmul sanity [[1,2],[3,4]]x[[5,6],[7,8]] = {out:?}");
+
+    // Phase 1: tokenizer (train once, then reuse the saved one).
+    let tok = if Path::new(TOK_PATH).exists() {
+        println!("loading tokenizer from {TOK_PATH}");
+        tokenizers::Tokenizer::from_file(TOK_PATH)?
+    } else {
+        println!("training byte-level BPE (vocab={VOCAB_SIZE}) on {CORPUS} ...");
+        train_bpe(CORPUS, TOK_PATH, VOCAB_SIZE)?
+    };
+    println!("vocab size = {}", tok.get_vocab_size(true));
+
+    // Encode corpus -> train/val bins (once).
+    if !(Path::new(TRAIN_BIN).exists() && Path::new(VAL_BIN).exists()) {
+        let text = std::fs::read_to_string(CORPUS)?;
+        let split = text.len() * 9 / 10; // tinyshakespeare is ASCII -> byte split is safe
+        let (train_text, val_text) = text.split_at(split);
+        let train_ids = encode_ids(&tok, train_text)?;
+        let val_ids = encode_ids(&tok, val_text)?;
+        write_u16_le(TRAIN_BIN, &train_ids)?;
+        write_u16_le(VAL_BIN, &val_ids)?;
+        println!("wrote {} train + {} val tokens", train_ids.len(), val_ids.len());
+    }
+
+    // Fertig-wenn: pull a batch, decode it, see readable text.
+    let loader = DataLoader::from_bin(TRAIN_BIN, BATCH_SIZE, BLOCK_SIZE)?;
+    println!("train.bin = {} tokens", loader.num_tokens());
+    let mut rng = rand::thread_rng();
+    let (x, y) = loader.next_batch(&mut rng);
+    println!("batch x,y each = [{BATCH_SIZE}, {BLOCK_SIZE}] = {} tokens", x.len());
+
+    let row0: Vec<u32> = x[0..BLOCK_SIZE].iter().map(|&t| t as u32).collect();
+    let decoded = tok.decode(&row0, false)?;
+    println!("\n--- decoded batch row 0 ---\n{decoded}\n---------------------------");
+
+    // Within a row, targets are inputs shifted left by one.
+    assert_eq!(&x[1..BLOCK_SIZE], &y[0..BLOCK_SIZE - 1]);
+    println!("targets == inputs shifted by 1 ✓");
+
+    Ok(())
 }
 
 #[cfg(test)]
