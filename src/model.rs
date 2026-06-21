@@ -113,6 +113,8 @@ struct ActLayout {
     lnf_mean: Off,  // (B, T)
     lnf_rstd: Off,  // (B, T)
     logits: Off,    // (B, T, V)
+    probs: Off,     // (B, T, V)
+    losses: Off,    // (B, T)
     total: usize,
 }
 
@@ -148,10 +150,12 @@ impl ActLayout {
         let lnf_mean = take(bt);
         let lnf_rstd = take(bt);
         let logits = take(bt * v);
+        let probs = take(bt * v);
+        let losses = take(bt);
         Self {
             encoded, ln1, ln1_mean, ln1_rstd, qkv, atty, preatt, att, attproj,
             residual2, ln2, ln2_mean, ln2_rstd, fch, fch_gelu, fcproj, residual3,
-            lnf, lnf_mean, lnf_rstd, logits, total: o,
+            lnf, lnf_mean, lnf_rstd, logits, probs, losses, total: o,
         }
     }
 }
@@ -199,7 +203,10 @@ impl Gpt {
     }
 
     /// Run the forward pass for one batch of token ids (`len == B*T`).
-    pub fn forward(&mut self, ids: &[u16]) {
+    ///
+    /// If `targets` is given, also computes softmax `probs` + per-token
+    /// cross-entropy `losses` and returns the mean loss over `B*T`.
+    pub fn forward(&mut self, ids: &[u16], targets: Option<&[u16]>) -> Option<f32> {
         let c = self.cfg;
         let (b, t, ch, nh, v, nl) =
             (c.batch_size, c.block_size, c.n_embd, c.n_head, c.vocab_size, c.n_layer);
@@ -292,6 +299,15 @@ impl Gpt {
         );
         // lm_head is weight-tied to wte: logits = lnf @ wte^T, no bias.
         matmul_forward(&mut self.acts, al.logits.off, al.lnf.off, &self.params[pl.wte.range()], None, bt, ch, v);
+
+        // Loss (optional).
+        targets.map(|targets| {
+            assert_eq!(targets.len(), bt, "targets must be batch_size * block_size");
+            softmax_forward(&mut self.acts, al.probs.off, al.logits.off, bt, v);
+            crossentropy_forward(&mut self.acts, al.losses.off, al.probs.off, targets, bt, v);
+            let losses = &self.acts[al.losses.range()];
+            losses.iter().sum::<f32>() / bt as f32
+        })
     }
 }
 
@@ -462,6 +478,45 @@ fn residual_forward(acts: &mut [f32], out_off: usize, in1_off: usize, in2_off: u
     }
 }
 
+/// Row-wise softmax of `logits [n, v]` into `probs [n, v]` (numerically stable).
+fn softmax_forward(acts: &mut [f32], probs_off: usize, logits_off: usize, n: usize, v: usize) {
+    for r in 0..n {
+        let lb = logits_off + r * v;
+        let pb = probs_off + r * v;
+        let mut maxval = f32::NEG_INFINITY;
+        for i in 0..v {
+            if acts[lb + i] > maxval {
+                maxval = acts[lb + i];
+            }
+        }
+        let mut sum = 0.0f32;
+        for i in 0..v {
+            let e = (acts[lb + i] - maxval).exp();
+            acts[pb + i] = e;
+            sum += e;
+        }
+        let inv = 1.0 / sum;
+        for i in 0..v {
+            acts[pb + i] *= inv;
+        }
+    }
+}
+
+/// Per-token cross-entropy `losses[r] = -ln(probs[r, target[r]])`.
+fn crossentropy_forward(
+    acts: &mut [f32],
+    losses_off: usize,
+    probs_off: usize,
+    targets: &[u16],
+    n: usize,
+    v: usize,
+) {
+    for r in 0..n {
+        let ix = targets[r] as usize;
+        acts[losses_off + r] = -acts[probs_off + r * v + ix].ln();
+    }
+}
+
 /// Tanh-approximation GELU (the GPT-2 variant).
 fn gelu_forward(acts: &mut [f32], out_off: usize, inp_off: usize, n: usize) {
     for i in 0..n {
@@ -492,10 +547,34 @@ mod tests {
         let ids: Vec<u16> = (0..cfg.batch_size * cfg.block_size)
             .map(|i| (i % cfg.vocab_size) as u16)
             .collect();
-        model.forward(&ids);
+        model.forward(&ids, None);
 
         let logits = model.logits();
         assert_eq!(logits.len(), cfg.batch_size * cfg.block_size * cfg.vocab_size);
         assert!(logits.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn untrained_loss_near_ln_vocab() {
+        let cfg = Config {
+            n_layer: 2,
+            n_head: 4,
+            n_embd: 32,
+            block_size: 16,
+            vocab_size: 128,
+            batch_size: 4,
+        };
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut model = Gpt::new(cfg, &mut rng);
+        let n = cfg.batch_size * cfg.block_size;
+        let ids: Vec<u16> = (0..n).map(|i| (i % cfg.vocab_size) as u16).collect();
+        let targets: Vec<u16> = (0..n).map(|i| ((i * 7) % cfg.vocab_size) as u16).collect();
+
+        let loss = model.forward(&ids, Some(&targets)).unwrap();
+        let expected = (cfg.vocab_size as f32).ln();
+        assert!(
+            (loss - expected).abs() < 0.5,
+            "untrained loss {loss} far from ln(vocab) {expected}"
+        );
     }
 }

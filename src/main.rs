@@ -100,7 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     let mut model = Gpt::new(cfg, &mut rng);
     println!("\nmodel: {} params", model.num_params());
-    model.forward(&x);
+    let loss = model.forward(&x, Some(&y)).unwrap();
 
     let logits = model.logits();
     assert_eq!(logits.len(), BATCH_SIZE * BLOCK_SIZE * VOCAB_SIZE);
@@ -130,6 +130,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .unwrap();
     let pred = tok.decode(&[argmax], false)?;
     println!("untrained next-token prediction (row 0): id {argmax} = {pred:?}");
+
+    // Phase 3: untrained loss should sit near ln(vocab_size) (uniform-guess).
+    let expected = (VOCAB_SIZE as f32).ln();
+    println!("loss = {loss:.4}  (expected ~ln({VOCAB_SIZE}) = {expected:.4})");
 
     Ok(())
 }
