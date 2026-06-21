@@ -14,6 +14,7 @@ use std::io::{Read, Write};
 
 use num_traits::Float;
 use rand::Rng;
+use rayon::prelude::*;
 
 /// Model hyperparameters. Weights are flat `Vec<f32>` buffers shaped by these.
 #[derive(Debug, Clone, Copy)]
@@ -339,7 +340,7 @@ impl Gpt {
 /// The single backward implementation, generic over the float type (mirrors
 /// `forward_into`). Zeroes `grads`/`gacts`, then accumulates gradients in
 /// reverse order. `acts` must hold the forward activations for these `params`.
-fn backward_into<F: Float>(
+fn backward_into<F: Float + Send + Sync>(
     cfg: &Config,
     params: &[F],
     acts: &[F],
@@ -367,7 +368,7 @@ fn backward_into<F: Float>(
 
     crossentropy_softmax_backward(gacts, al.logits.off, acts, al.probs.off, targets, bt, v, dmean);
     // lm_head (logits = lnf @ wte^T, tied weight, no bias)
-    matmul_backward(
+    linear_backward(
         gacts, al.lnf.off, al.logits.off,
         grads, pl.wte.off, None,
         acts, al.lnf.off, params, pl.wte.off, bt, ch, v,
@@ -422,7 +423,7 @@ fn backward_into<F: Float>(
         // residual3 = residual2 + fcproj
         residual_backward(gacts, residual2_off, fcproj_off, residual3_off, bt * ch);
         // fcproj = fch_gelu @ fcprojw^T + fcprojb
-        matmul_backward(
+        linear_backward(
             gacts, fch_gelu_off, fcproj_off,
             grads, fcprojw_off, Some(fcprojb_off),
             acts, fch_gelu_off, params, fcprojw_off, bt, 4 * ch, ch,
@@ -475,7 +476,7 @@ fn backward_into<F: Float>(
 /// The single forward implementation, generic over the float type so the exact
 /// same math runs in f32 (real model, cached for backward) and f64 (the
 /// gradient-check reference loss).
-fn forward_into<F: Float>(
+fn forward_into<F: Float + Send + Sync>(
     cfg: &Config,
     params: &[F],
     acts: &mut [F],
@@ -537,14 +538,14 @@ fn forward_into<F: Float>(
         let fcprojb = &params[pl.fcprojb.off + l * ch..pl.fcprojb.off + (l + 1) * ch];
 
         layernorm_forward(acts, ln1_off, ln1_mean_off, ln1_rstd_off, res_off, ln1w, ln1b, bt, ch);
-        matmul_forward(acts, qkv_off, ln1_off, qkvw, Some(qkvb), bt, ch, 3 * ch);
+        linear(acts, qkv_off, ln1_off, qkvw, Some(qkvb), bt, ch, 3 * ch);
         attention_forward(acts, atty_off, preatt_off, att_off, qkv_off, b, t, ch, nh);
-        matmul_forward(acts, attproj_off, atty_off, attprojw, Some(attprojb), bt, ch, ch);
+        linear(acts, attproj_off, atty_off, attprojw, Some(attprojb), bt, ch, ch);
         residual_forward(acts, residual2_off, res_off, attproj_off, bt * ch);
         layernorm_forward(acts, ln2_off, ln2_mean_off, ln2_rstd_off, residual2_off, ln2w, ln2b, bt, ch);
-        matmul_forward(acts, fch_off, ln2_off, fcw, Some(fcb), bt, ch, 4 * ch);
+        linear(acts, fch_off, ln2_off, fcw, Some(fcb), bt, ch, 4 * ch);
         gelu_forward(acts, fch_gelu_off, fch_off, bt * 4 * ch);
-        matmul_forward(acts, fcproj_off, fch_gelu_off, fcprojw, Some(fcprojb), bt, 4 * ch, ch);
+        linear(acts, fcproj_off, fch_gelu_off, fcprojw, Some(fcprojb), bt, 4 * ch, ch);
         residual_forward(acts, residual3_off, residual2_off, fcproj_off, bt * ch);
     }
 
@@ -554,7 +555,7 @@ fn forward_into<F: Float>(
         &params[pl.lnfw.range()], &params[pl.lnfb.range()], bt, ch,
     );
     // lm_head is weight-tied to wte: logits = lnf @ wte^T, no bias.
-    matmul_forward(acts, al.logits.off, al.lnf.off, &params[pl.wte.range()], None, bt, ch, v);
+    linear(acts, al.logits.off, al.lnf.off, &params[pl.wte.range()], None, bt, ch, v);
 
     targets.map(|targets| {
         assert_eq!(targets.len(), bt, "targets must be batch_size * block_size");
@@ -641,8 +642,58 @@ fn layernorm_forward<F: Float>(
     }
 }
 
+/// Split two disjoint sub-ranges out of one buffer as mutable slices, in either
+/// order. Returns `(a, b)` for the requested `(a_off, a_len)` and `(b_off, b_len)`.
+/// Lets parallel ops read one arena tensor while writing another.
+fn disjoint_mut<F>(
+    buf: &mut [F],
+    a_off: usize,
+    a_len: usize,
+    b_off: usize,
+    b_len: usize,
+) -> (&mut [F], &mut [F]) {
+    assert!(
+        a_off + a_len <= b_off || b_off + b_len <= a_off,
+        "ranges overlap"
+    );
+    if a_off < b_off {
+        let (l, r) = buf.split_at_mut(b_off);
+        (&mut l[a_off..a_off + a_len], &mut r[..b_len])
+    } else {
+        let (l, r) = buf.split_at_mut(a_off);
+        (&mut r[..a_len], &mut l[b_off..b_off + b_len])
+    }
+}
+
 /// Linear layer with weight `[OC, C]` (row = output unit): `out = inp @ W^T + b`.
-fn matmul_forward<F: Float>(
+/// Parallel over output rows; each output element's dot product stays in one
+/// thread, so results are identical to the serial version.
+fn matmul_forward<F: Float + Send + Sync>(
+    out: &mut [F],
+    inp: &[F],
+    weight: &[F],
+    bias: Option<&[F]>,
+    n: usize,
+    c: usize,
+    oc: usize,
+) {
+    debug_assert_eq!(out.len(), n * oc);
+    debug_assert_eq!(inp.len(), n * c);
+    out.par_chunks_mut(oc).enumerate().for_each(|(r, orow)| {
+        let irow = &inp[r * c..(r + 1) * c];
+        for o in 0..oc {
+            let mut val = bias.map_or(F::zero(), |b| b[o]);
+            let w = &weight[o * c..(o + 1) * c];
+            for i in 0..c {
+                val = val + irow[i] * w[i];
+            }
+            orow[o] = val;
+        }
+    });
+}
+
+/// Arena adapter for `matmul_forward`: splits `inp`/`out` tensors out of `acts`.
+fn linear<F: Float + Send + Sync>(
     acts: &mut [F],
     out_off: usize,
     inp_off: usize,
@@ -652,18 +703,8 @@ fn matmul_forward<F: Float>(
     c: usize,
     oc: usize,
 ) {
-    for r in 0..n {
-        let ib = inp_off + r * c;
-        let ob = out_off + r * oc;
-        for o in 0..oc {
-            let mut val = bias.map_or(F::zero(), |b| b[o]);
-            let wb = o * c;
-            for i in 0..c {
-                val = val + acts[ib + i] * weight[wb + i];
-            }
-            acts[ob + o] = val;
-        }
-    }
+    let (inp, out) = disjoint_mut(acts, inp_off, n * c, out_off, n * oc);
+    matmul_forward(out, inp, weight, bias, n, c, oc);
 }
 
 /// Causal multi-head self-attention. `inp` is the packed qkv `[B, T, 3C]`.
@@ -819,8 +860,69 @@ fn crossentropy_softmax_backward<F: Float>(
     }
 }
 
-/// Backward of the `[OC, C]` linear. Accumulates `dinp`, `dweight`, `dbias`.
-fn matmul_backward<F: Float>(
+/// Backward of the `[OC, C]` linear. Accumulates into `dinp`, `dweight`, `dbias`
+/// (each fresh/zeroed). `dinp` is parallel over rows, the weight/bias reduction
+/// is parallel over output units, so per-element accumulation order matches the
+/// serial version.
+fn matmul_backward<F: Float + Send + Sync>(
+    dinp: &mut [F],
+    dout: &[F],
+    dweight: &mut [F],
+    dbias: Option<&mut [F]>,
+    inp: &[F],
+    weight: &[F],
+    n: usize,
+    c: usize,
+    oc: usize,
+) {
+    // dinp[r,:] += sum_o dout[r,o] * weight[o,:]
+    dinp.par_chunks_mut(c).enumerate().for_each(|(r, dinp_r)| {
+        let dout_r = &dout[r * oc..(r + 1) * oc];
+        for o in 0..oc {
+            let d = dout_r[o];
+            let w = &weight[o * c..(o + 1) * c];
+            for i in 0..c {
+                dinp_r[i] = dinp_r[i] + w[i] * d;
+            }
+        }
+    });
+    // dweight[o,:] += sum_r dout[r,o] * inp[r,:] ; dbias[o] += sum_r dout[r,o]
+    match dbias {
+        Some(dbias) => {
+            dweight
+                .par_chunks_mut(c)
+                .zip(dbias.par_iter_mut())
+                .enumerate()
+                .for_each(|(o, (dw, db))| {
+                    let mut acc = F::zero();
+                    for r in 0..n {
+                        let d = dout[r * oc + o];
+                        let inp_r = &inp[r * c..(r + 1) * c];
+                        for i in 0..c {
+                            dw[i] = dw[i] + inp_r[i] * d;
+                        }
+                        acc = acc + d;
+                    }
+                    *db = *db + acc;
+                });
+        }
+        None => {
+            dweight.par_chunks_mut(c).enumerate().for_each(|(o, dw)| {
+                for r in 0..n {
+                    let d = dout[r * oc + o];
+                    let inp_r = &inp[r * c..(r + 1) * c];
+                    for i in 0..c {
+                        dw[i] = dw[i] + inp_r[i] * d;
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// Arena adapter for `matmul_backward`: carves the `dinp`/`dout` tensors out of
+/// `gacts` and the `dweight`/`dbias` tensors out of `grads`.
+fn linear_backward<F: Float + Send + Sync>(
     gacts: &mut [F],
     dinp_off: usize,
     dout_off: usize,
@@ -835,30 +937,17 @@ fn matmul_backward<F: Float>(
     c: usize,
     oc: usize,
 ) {
-    // dinp += dout @ weight
-    for r in 0..n {
-        let dib = dinp_off + r * c;
-        let dob = dout_off + r * oc;
-        for o in 0..oc {
-            let d = gacts[dob + o];
-            let wb = weight_off + o * c;
-            for i in 0..c {
-                gacts[dib + i] = gacts[dib + i] + params[wb + i] * d;
-            }
+    let (dinp, dout) = disjoint_mut(gacts, dinp_off, n * c, dout_off, n * oc);
+    let inp = &acts[inp_off..inp_off + n * c];
+    let weight = &params[weight_off..weight_off + oc * c];
+    match dbias_off {
+        Some(dbo) => {
+            let (dweight, dbias) = disjoint_mut(grads, dweight_off, oc * c, dbo, oc);
+            matmul_backward(dinp, dout, dweight, Some(dbias), inp, weight, n, c, oc);
         }
-    }
-    // dweight += dout^T @ inp ; dbias += sum dout
-    for o in 0..oc {
-        let dwb = dweight_off + o * c;
-        for r in 0..n {
-            let d = gacts[dout_off + r * oc + o];
-            let ib = inp_off + r * c;
-            for i in 0..c {
-                grads[dwb + i] = grads[dwb + i] + acts[ib + i] * d;
-            }
-            if let Some(dbo) = dbias_off {
-                grads[dbo + o] = grads[dbo + o] + d;
-            }
+        None => {
+            let dweight = &mut grads[dweight_off..dweight_off + oc * c];
+            matmul_backward(dinp, dout, dweight, None, inp, weight, n, c, oc);
         }
     }
 }

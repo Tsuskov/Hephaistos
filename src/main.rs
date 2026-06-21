@@ -185,7 +185,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ckpt_path: CKPT.to_string(),
     };
     println!("\nPhase 6 training (start loss ~ln(1024) = {:.2}):", (VOCAB_SIZE as f32).ln());
+    let t0 = std::time::Instant::now();
     let best = train::train(&mut train_model, &loader, &val_loader, &mut rng, &tcfg)?;
+    let dt = t0.elapsed().as_secs_f64();
+    println!("trained {} steps in {dt:.2}s ({:.1} steps/s)", tcfg.steps, tcfg.steps as f64 / dt);
     train_model.load_params(CKPT)?; // restore best-val weights
     println!("best val loss = {best:.4}  (restored from {CKPT})");
 
