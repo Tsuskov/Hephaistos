@@ -8,6 +8,7 @@
 mod data;
 mod gradcheck;
 mod model;
+mod train;
 
 use std::path::Path;
 
@@ -18,6 +19,7 @@ const CORPUS: &str = "data/input.txt";
 const TOK_PATH: &str = "data/tokenizer.json";
 const TRAIN_BIN: &str = "data/train.bin";
 const VAL_BIN: &str = "data/val.bin";
+const CKPT: &str = "data/ckpt.bin";
 const VOCAB_SIZE: usize = 1024;
 const BATCH_SIZE: usize = 4;
 const BLOCK_SIZE: usize = 64;
@@ -168,6 +170,23 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         worst = worst.max(*rel);
     }
     println!("worst tensor: {worst:.2e}");
+
+    // Phase 6: train the demo model on tinyshakespeare and watch the loss drop.
+    let val_loader = DataLoader::from_bin(VAL_BIN, BATCH_SIZE, BLOCK_SIZE)?;
+    let mut train_model = Gpt::new(cfg, &mut rng);
+    let tcfg = train::TrainConfig {
+        steps: 300,
+        lr: 1e-3,
+        weight_decay: 0.1,
+        eval_every: 25,
+        eval_batches: 5,
+        patience: 100,
+        ckpt_path: CKPT.to_string(),
+    };
+    println!("\nPhase 6 training (start loss ~ln(1024) = {:.2}):", (VOCAB_SIZE as f32).ln());
+    let best = train::train(&mut train_model, &loader, &val_loader, &mut rng, &tcfg)?;
+    train_model.load_params(CKPT)?; // restore best-val weights
+    println!("best val loss = {best:.4}  (restored from {CKPT})");
 
     Ok(())
 }

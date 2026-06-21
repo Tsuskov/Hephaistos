@@ -9,6 +9,9 @@
 //! `B` batch, `T` time/block, `C` channels (`n_embd`), `NH` heads,
 //! `HS = C/NH` head size, `V` vocab, `L` layers.
 
+use std::fs::File;
+use std::io::{Read, Write};
+
 use num_traits::Float;
 use rand::Rng;
 
@@ -169,6 +172,9 @@ pub struct Gpt {
     acts: Vec<f32>,
     grads: Vec<f32>,  // param gradients, same layout as `params`
     gacts: Vec<f32>,  // activation gradients, same layout as `acts`
+    m: Vec<f32>,      // AdamW first moment, param layout
+    v: Vec<f32>,      // AdamW second moment, param layout
+    adam_t: u64,      // AdamW timestep
     pl: ParamLayout,
     al: ActLayout,
 }
@@ -196,7 +202,9 @@ impl Gpt {
         let acts = vec![0.0f32; al.total];
         let grads = vec![0.0f32; pl.total];
         let gacts = vec![0.0f32; al.total];
-        Self { cfg, params, acts, grads, gacts, pl, al }
+        let m = vec![0.0f32; pl.total];
+        let v = vec![0.0f32; pl.total];
+        Self { cfg, params, acts, grads, gacts, m, v, adam_t: 0, pl, al }
     }
 
     pub fn num_params(&self) -> usize {
@@ -286,6 +294,45 @@ impl Gpt {
         let mut gacts = vec![0.0f64; self.al.total];
         backward_into::<f64>(&self.cfg, &params, &acts, &mut grads, &mut gacts, ids, targets);
         grads
+    }
+
+    /// One AdamW step using the gradients from the last `backward` (decoupled
+    /// weight decay). Updates params and the `m`/`v` moment buffers in place.
+    pub fn adamw_step(&mut self, lr: f32, beta1: f32, beta2: f32, eps: f32, weight_decay: f32) {
+        self.adam_t += 1;
+        let t = self.adam_t as i32;
+        let bc1 = 1.0 - beta1.powi(t); // bias corrections
+        let bc2 = 1.0 - beta2.powi(t);
+        for i in 0..self.params.len() {
+            let g = self.grads[i];
+            let m = beta1 * self.m[i] + (1.0 - beta1) * g;
+            let v = beta2 * self.v[i] + (1.0 - beta2) * g * g;
+            self.m[i] = m;
+            self.v[i] = v;
+            let m_hat = m / bc1;
+            let v_hat = v / bc2;
+            self.params[i] -= lr * (m_hat / (v_hat.sqrt() + eps) + weight_decay * self.params[i]);
+        }
+    }
+
+    /// Write parameters to `path` as little-endian f32 (a checkpoint).
+    pub fn save(&self, path: &str) -> std::io::Result<()> {
+        let mut bytes = Vec::with_capacity(self.params.len() * 4);
+        for &p in &self.params {
+            bytes.extend_from_slice(&p.to_le_bytes());
+        }
+        File::create(path)?.write_all(&bytes)
+    }
+
+    /// Load parameters previously written by `save`.
+    pub fn load_params(&mut self, path: &str) -> std::io::Result<()> {
+        let mut bytes = Vec::new();
+        File::open(path)?.read_to_end(&mut bytes)?;
+        assert_eq!(bytes.len(), self.params.len() * 4, "checkpoint size mismatch");
+        for (i, c) in bytes.chunks_exact(4).enumerate() {
+            self.params[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        }
+        Ok(())
     }
 }
 
@@ -1029,6 +1076,35 @@ mod tests {
         assert!(
             (loss - expected).abs() < 0.5,
             "untrained loss {loss} far from ln(vocab) {expected}"
+        );
+    }
+
+    #[test]
+    fn adamw_overfits_single_batch() {
+        let cfg = Config {
+            n_layer: 2,
+            n_head: 2,
+            n_embd: 16,
+            block_size: 8,
+            vocab_size: 32,
+            batch_size: 2,
+        };
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut model = Gpt::new(cfg, &mut rng);
+        let n = cfg.batch_size * cfg.block_size;
+        let ids: Vec<u16> = (0..n).map(|i| ((i * 5 + 3) % cfg.vocab_size) as u16).collect();
+        let targets: Vec<u16> = (0..n).map(|i| ((i * 11 + 1) % cfg.vocab_size) as u16).collect();
+
+        let first = model.forward(&ids, Some(&targets)).unwrap();
+        let mut last = first;
+        for _ in 0..300 {
+            last = model.forward(&ids, Some(&targets)).unwrap();
+            model.backward(&ids, &targets);
+            model.adamw_step(1e-2, 0.9, 0.999, 1e-8, 0.0);
+        }
+        assert!(
+            last < first * 0.1,
+            "loss did not drop enough: {first} -> {last}"
         );
     }
 }
