@@ -8,6 +8,7 @@
 mod data;
 mod gradcheck;
 mod model;
+mod sample;
 mod train;
 
 use std::path::Path;
@@ -187,6 +188,22 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let best = train::train(&mut train_model, &loader, &val_loader, &mut rng, &tcfg)?;
     train_model.load_params(CKPT)?; // restore best-val weights
     println!("best val loss = {best:.4}  (restored from {CKPT})");
+
+    // Phase 7: sample from the trained checkpoint. Params are independent of
+    // batch_size, so build a batch_size=1 twin and load the same weights.
+    let sample_cfg = Config { batch_size: 1, ..cfg };
+    let mut sample_model = Gpt::new(sample_cfg, &mut rng);
+    sample_model.load_params(CKPT)?;
+
+    let (seed_batch, _) = loader.next_batch(&mut rng);
+    let seed = &seed_batch[0..BLOCK_SIZE]; // a real contiguous snippet
+    let generated = sample::generate(&mut sample_model, seed, 200, 0.8, Some(40), &mut rng);
+
+    let seed_txt = tok.decode(&seed.iter().map(|&t| t as u32).collect::<Vec<_>>(), false)?;
+    let gen_txt = tok.decode(&generated.iter().map(|&t| t as u32).collect::<Vec<_>>(), false)?;
+    println!("\nPhase 7 sample (temperature 0.8, top-k 40):");
+    println!("--- seed ---\n{seed_txt}");
+    println!("--- generated ---\n{gen_txt}");
 
     Ok(())
 }
