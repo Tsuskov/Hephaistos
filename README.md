@@ -2,6 +2,8 @@
 
 <img src="giordano_forge.png" alt="Hephaistos — the forge" width="320"/>
 
+<p align="center"><sub><sub>Luca Giordano's <i>The Forge of Vulcan</i>, rendered with <a href="https://github.com/Tsuskov/ren-ascii-sance">ren-ascii-sance</a></sub></sub></p>
+
 # Hephaistos
 
 **A GPT / Llama-style language model forged from scratch in Rust — no autograd, no tensor framework, no GPU.**
@@ -146,7 +148,7 @@ cargo test
 
 ## Acknowledgements
 
-Inspired by Andrej Karpathy's [`llm.c`](https://github.com/karpathy/llm.c) and [nanoGPT](https://github.com/karpathy/nanoGPT), and standing on the architecture papers behind Llama: [RoPE](https://arxiv.org/abs/2104.09864), [RMSNorm](https://arxiv.org/abs/1910.07467), [SwiGLU](https://arxiv.org/abs/2002.05202), and [AdamW](https://arxiv.org/abs/1711.05101). The banner is Luca Giordano's *The Forge of Vulcan*.
+Inspired by Andrej Karpathy's [`llm.c`](https://github.com/karpathy/llm.c) and [nanoGPT](https://github.com/karpathy/nanoGPT), and standing on the architecture papers behind Llama: [RoPE](https://arxiv.org/abs/2104.09864), [RMSNorm](https://arxiv.org/abs/1910.07467), [SwiGLU](https://arxiv.org/abs/2002.05202), and [AdamW](https://arxiv.org/abs/1711.05101). The banner is an ASCII-style render of Luca Giordano's *The Forge of Vulcan*, generated with [ren-ascii-sance](https://github.com/Tsuskov/ren-ascii-sance).
 
 ## License
 
