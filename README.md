@@ -8,10 +8,7 @@
 
 Hand-written forward *and* backward passes, every gradient verified against numerical differentiation, trained on CPU, and exported to GGUF so the result runs in `llama.cpp` and Ollama.
 
-[![CI](https://img.shields.io/github/actions/workflow/status/Tsuskov/Hephaistos/ci.yml?branch=main&style=flat-square&label=ci)](https://github.com/Tsuskov/Hephaistos/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-edition_2024-orange?style=flat-square&logo=rust&logoColor=white)](Cargo.toml)
-![Autograd](https://img.shields.io/badge/autograd-none-555?style=flat-square)
+
 
 </div>
 
