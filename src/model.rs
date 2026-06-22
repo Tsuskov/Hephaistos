@@ -395,6 +395,83 @@ impl Gpt {
         }
         Ok(())
     }
+
+    /// Phase 11 — export the trained weights as a llama-architecture GGUF that
+    /// llama.cpp / Ollama can run. Maps our tensor names to the GGUF llama names,
+    /// permutes q/k from our half-rotated RoPE layout to GGUF's interleaved
+    /// layout, and embeds the byte-level BPE tokenizer from `tokenizer_path`.
+    pub fn export_gguf(&self, tokenizer_path: &str, out_path: &str) -> std::io::Result<()> {
+        let c = &self.cfg;
+        let (ch, nh, v, nl) = (c.n_embd, c.n_head, c.vocab_size, c.n_layer);
+        let hd = ch / nh;
+        let hidden = swiglu_hidden(ch);
+        let p = &self.params;
+        let pl = &self.pl;
+
+        let mut w = crate::gguf::GgufWriter::new();
+        w.kv_str("general.architecture", "llama");
+        w.kv_str("general.name", "Hephaistos");
+        w.kv_u32("llama.context_length", c.block_size as u32);
+        w.kv_u32("llama.embedding_length", ch as u32);
+        w.kv_u32("llama.block_count", nl as u32);
+        w.kv_u32("llama.feed_forward_length", hidden as u32);
+        w.kv_u32("llama.attention.head_count", nh as u32);
+        w.kv_u32("llama.attention.head_count_kv", nh as u32);
+        w.kv_f32("llama.attention.layer_norm_rms_epsilon", 1e-5);
+        w.kv_u32("llama.rope.dimension_count", hd as u32);
+        w.kv_f32("llama.rope.freq_base", 10000.0);
+        w.kv_u32("general.file_type", 0); // ALL_F32
+        crate::gguf::add_byte_bpe_tokenizer(&mut w, tokenizer_path)?;
+
+        // GGUF ne dims are reversed vs row-major shape: a [rows, cols] weight is
+        // emitted as [cols, rows] with the same row-major data.
+        w.add_tensor("token_embd.weight", vec![ch as u64, v as u64], &p[pl.wte.range()]);
+        w.add_tensor("output_norm.weight", vec![ch as u64], &p[pl.lnfw.range()]);
+        w.add_tensor("output.weight", vec![ch as u64, v as u64], &p[pl.lm_head.range()]);
+        for l in 0..nl {
+            let ln1 = &p[pl.ln1w.off + l * ch..pl.ln1w.off + (l + 1) * ch];
+            let ln2 = &p[pl.ln2w.off + l * ch..pl.ln2w.off + (l + 1) * ch];
+            let qkv = &p[pl.qkvw.off + l * 3 * ch * ch..pl.qkvw.off + (l + 1) * 3 * ch * ch];
+            let (q, rest) = qkv.split_at(ch * ch);
+            let (k, vv) = rest.split_at(ch * ch);
+            let attproj = &p[pl.attprojw.off + l * ch * ch..pl.attprojw.off + (l + 1) * ch * ch];
+            let w1 = &p[pl.w1.off + l * hidden * ch..pl.w1.off + (l + 1) * hidden * ch];
+            let w3 = &p[pl.w3.off + l * hidden * ch..pl.w3.off + (l + 1) * hidden * ch];
+            let w2 = &p[pl.w2.off + l * ch * hidden..pl.w2.off + (l + 1) * ch * hidden];
+
+            let qp = permute_qk(q, nh, hd, ch);
+            let kp = permute_qk(k, nh, hd, ch);
+            w.add_tensor(&format!("blk.{l}.attn_norm.weight"), vec![ch as u64], ln1);
+            w.add_tensor(&format!("blk.{l}.attn_q.weight"), vec![ch as u64, ch as u64], &qp);
+            w.add_tensor(&format!("blk.{l}.attn_k.weight"), vec![ch as u64, ch as u64], &kp);
+            w.add_tensor(&format!("blk.{l}.attn_v.weight"), vec![ch as u64, ch as u64], vv);
+            w.add_tensor(&format!("blk.{l}.attn_output.weight"), vec![ch as u64, ch as u64], attproj);
+            w.add_tensor(&format!("blk.{l}.ffn_norm.weight"), vec![ch as u64], ln2);
+            w.add_tensor(&format!("blk.{l}.ffn_gate.weight"), vec![ch as u64, hidden as u64], w1);
+            w.add_tensor(&format!("blk.{l}.ffn_up.weight"), vec![ch as u64, hidden as u64], w3);
+            w.add_tensor(&format!("blk.{l}.ffn_down.weight"), vec![hidden as u64, ch as u64], w2);
+        }
+        w.write(out_path)
+    }
+}
+
+/// HF rotate-half RoPE layout -> GGUF llama interleaved layout for a `[C, C]`
+/// q or k weight (rows = output channels). Reorders, within each head, the
+/// head's output rows from `[first half, second half]` to interleaved pairs.
+fn permute_qk(data: &[f32], n_head: usize, head_dim: usize, cols: usize) -> Vec<f32> {
+    let half = head_dim / 2;
+    let mut out = vec![0.0f32; data.len()];
+    for h in 0..n_head {
+        for j in 0..half {
+            for hi in 0..2 {
+                let new_row = h * head_dim + j * 2 + hi;
+                let old_row = h * head_dim + hi * half + j;
+                out[new_row * cols..(new_row + 1) * cols]
+                    .copy_from_slice(&data[old_row * cols..(old_row + 1) * cols]);
+            }
+        }
+    }
+    out
 }
 
 /// The single backward implementation, generic over the float type (mirrors
@@ -1521,5 +1598,27 @@ mod tests {
             worst = worst.max(rel);
         }
         assert!(worst < 1e-5, "dropout gradient check failed: {worst:e}");
+    }
+
+    /// The q/k RoPE-layout permute must be a pure row permutation: every output
+    /// row equals exactly one distinct input row (no gaps, no overwrites).
+    #[test]
+    fn permute_qk_is_a_row_permutation() {
+        let (n_head, head_dim, cols) = (4, 6, 3);
+        let rows = n_head * head_dim;
+        // tag each row r with the value r in all its columns
+        let data: Vec<f32> = (0..rows).flat_map(|r| vec![r as f32; cols]).collect();
+        let out = permute_qk(&data, n_head, head_dim, cols);
+
+        let mut seen = vec![false; rows];
+        for r in 0..rows {
+            let tag = out[r * cols] as usize;
+            assert!(tag < rows && !seen[tag], "row {tag} missing or duplicated");
+            seen[tag] = true;
+            for k in 0..cols {
+                assert_eq!(out[r * cols + k], tag as f32, "row not copied wholesale");
+            }
+        }
+        assert!(seen.iter().all(|&s| s), "permute dropped a row");
     }
 }

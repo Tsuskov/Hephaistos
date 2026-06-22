@@ -6,6 +6,7 @@
 //! Phase 4: gradient-check harness (see `gradcheck`).
 
 mod data;
+mod gguf;
 mod gradcheck;
 mod model;
 mod sample;
@@ -56,6 +57,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Gated behind an env var so the default run stays the phase-0..7 demo.
     if std::env::var("PHASE8").is_ok() {
         return phase8();
+    }
+    // Phase 11: export the trained Greek checkpoint to GGUF (run after training).
+    if std::env::var("EXPORT_GGUF").is_ok() {
+        return export_gguf();
     }
 
     // Phase 0 sanity.
@@ -276,6 +281,30 @@ fn phase8() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let best = train::train(&mut model, &loader, &val_loader, &mut rng, &tcfg)?;
     let dt = t0.elapsed().as_secs_f64();
     println!("done: {steps} steps in {dt:.1}s ({:.2} steps/s), best val {best:.4}", steps as f64 / dt);
+    Ok(())
+}
+
+/// Phase 11 — load the trained Greek checkpoint and write a llama-arch GGUF.
+fn export_gguf() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    const CKPT: &str = "data/greek_ckpt.bin";
+    const TOK: &str = "data/greek_tokenizer.json";
+    const OUT: &str = "hephaistos.gguf";
+
+    let cfg = Config {
+        n_layer: 8,
+        n_head: 8,
+        n_embd: 384,
+        block_size: 256,
+        vocab_size: 2048,
+        batch_size: 1, // params are independent of batch size
+    };
+    let mut rng = rand::thread_rng();
+    let mut model = Gpt::new(cfg, &mut rng);
+    model.load_params(CKPT)?;
+    model.export_gguf(TOK, OUT)?;
+    let sz = std::fs::metadata(OUT)?.len() as f64 / 1e6;
+    println!("wrote {OUT} ({sz:.1} MB) — llama arch, {}L/{}H/{}d, vocab {}",
+        cfg.n_layer, cfg.n_head, cfg.n_embd, cfg.vocab_size);
     Ok(())
 }
 

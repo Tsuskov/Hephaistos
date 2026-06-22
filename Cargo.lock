@@ -237,6 +237,7 @@ dependencies = [
  "num-traits",
  "rand 0.8.6",
  "rayon",
+ "serde_json",
  "tokenizers",
 ]
 
