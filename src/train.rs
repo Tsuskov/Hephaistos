@@ -41,7 +41,7 @@ pub fn train<R: Rng>(
 
     for step in 1..=cfg.steps {
         let (x, y) = train.next_batch(rng);
-        let loss = model.forward(&x, Some(&y)).unwrap();
+        let loss = model.forward_train(&x, Some(&y), rng).unwrap();
         model.backward(&x, &y);
         model.adamw_step(cfg.lr, beta1, beta2, eps, cfg.weight_decay);
 

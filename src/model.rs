@@ -44,27 +44,27 @@ impl Off {
 #[derive(Clone, Copy)]
 struct ParamLayout {
     wte: Off,      // (V, C) token embedding (also tied lm_head weight)
-    wpe: Off,      // (maxT, C) positional embedding
-    ln1w: Off,     // (L, C)
-    ln1b: Off,     // (L, C)
-    qkvw: Off,     // (L, 3C, C)
-    qkvb: Off,     // (L, 3C)
-    attprojw: Off, // (L, C, C)
-    attprojb: Off, // (L, C)
-    ln2w: Off,     // (L, C)
-    ln2b: Off,     // (L, C)
-    fcw: Off,      // (L, 4C, C)
-    fcb: Off,      // (L, 4C)
-    fcprojw: Off,  // (L, C, 4C)
-    fcprojb: Off,  // (L, C)
-    lnfw: Off,     // (C)
-    lnfb: Off,     // (C)
+    ln1w: Off,     // (L, C) RMSNorm weight (no bias)
+    qkvw: Off,     // (L, 3C, C) no bias (Llama)
+    attprojw: Off, // (L, C, C) no bias (Llama)
+    ln2w: Off,     // (L, C) RMSNorm weight (no bias)
+    w1: Off,       // (L, H, C) SwiGLU gate, no bias
+    w3: Off,       // (L, H, C) SwiGLU up, no bias
+    w2: Off,       // (L, C, H) SwiGLU down, no bias
+    lnfw: Off,     // (C) RMSNorm weight (no bias)
+    lm_head: Off,  // (V, C) output projection, untied from wte, no bias
     total: usize,
+}
+
+/// SwiGLU hidden width: `int(8/3 · n_embd)`, chosen so the gated FFN has roughly
+/// the same parameter count as the 4·n_embd GELU MLP it replaces.
+fn swiglu_hidden(ch: usize) -> usize {
+    (8.0 / 3.0 * ch as f64) as usize
 }
 
 impl ParamLayout {
     fn new(c: &Config) -> Self {
-        let (l, v, ch, mt) = (c.n_layer, c.vocab_size, c.n_embd, c.block_size);
+        let (l, v, ch) = (c.n_layer, c.vocab_size, c.n_embd);
         let mut o = 0usize;
         let mut take = |n: usize| {
             let off = o;
@@ -72,24 +72,19 @@ impl ParamLayout {
             Off { off, len: n }
         };
         let wte = take(v * ch);
-        let wpe = take(mt * ch);
         let ln1w = take(l * ch);
-        let ln1b = take(l * ch);
         let qkvw = take(l * 3 * ch * ch);
-        let qkvb = take(l * 3 * ch);
         let attprojw = take(l * ch * ch);
-        let attprojb = take(l * ch);
         let ln2w = take(l * ch);
-        let ln2b = take(l * ch);
-        let fcw = take(l * 4 * ch * ch);
-        let fcb = take(l * 4 * ch);
-        let fcprojw = take(l * ch * 4 * ch);
-        let fcprojb = take(l * ch);
+        let h = swiglu_hidden(ch);
+        let w1 = take(l * h * ch);
+        let w3 = take(l * h * ch);
+        let w2 = take(l * ch * h);
         let lnfw = take(ch);
-        let lnfb = take(ch);
+        let lm_head = take(v * ch);
         Self {
-            wte, wpe, ln1w, ln1b, qkvw, qkvb, attprojw, attprojb, ln2w, ln2b,
-            fcw, fcb, fcprojw, fcprojb, lnfw, lnfb, total: o,
+            wte, ln1w, qkvw, attprojw, ln2w,
+            w1, w3, w2, lnfw, lm_head, total: o,
         }
     }
 }
@@ -99,8 +94,7 @@ impl ParamLayout {
 struct ActLayout {
     encoded: Off,   // (B, T, C)
     ln1: Off,       // (L, B, T, C)
-    ln1_mean: Off,  // (L, B, T)
-    ln1_rstd: Off,  // (L, B, T)
+    ln1_rstd: Off,  // (L, B, T) RMSNorm rstd
     qkv: Off,       // (L, B, T, 3C)
     atty: Off,      // (L, B, T, C)
     preatt: Off,    // (L, B, NH, T, T)
@@ -108,15 +102,14 @@ struct ActLayout {
     attproj: Off,   // (L, B, T, C)
     residual2: Off, // (L, B, T, C)
     ln2: Off,       // (L, B, T, C)
-    ln2_mean: Off,  // (L, B, T)
-    ln2_rstd: Off,  // (L, B, T)
-    fch: Off,       // (L, B, T, 4C)
-    fch_gelu: Off,  // (L, B, T, 4C)
+    ln2_rstd: Off,  // (L, B, T) RMSNorm rstd
+    gate: Off,      // (L, B, T, H) SwiGLU w1·x (pre-silu)
+    up: Off,        // (L, B, T, H) SwiGLU w3·x
+    glu: Off,       // (L, B, T, H) silu(gate)·up
     fcproj: Off,    // (L, B, T, C)
     residual3: Off, // (L, B, T, C)
     lnf: Off,       // (B, T, C)
-    lnf_mean: Off,  // (B, T)
-    lnf_rstd: Off,  // (B, T)
+    lnf_rstd: Off,  // (B, T) RMSNorm rstd
     logits: Off,    // (B, T, V)
     probs: Off,     // (B, T, V)
     losses: Off,    // (B, T)
@@ -136,7 +129,6 @@ impl ActLayout {
         };
         let encoded = take(bt * ch);
         let ln1 = take(l * bt * ch);
-        let ln1_mean = take(l * bt);
         let ln1_rstd = take(l * bt);
         let qkv = take(l * bt * 3 * ch);
         let atty = take(l * bt * ch);
@@ -145,27 +137,59 @@ impl ActLayout {
         let attproj = take(l * bt * ch);
         let residual2 = take(l * bt * ch);
         let ln2 = take(l * bt * ch);
-        let ln2_mean = take(l * bt);
         let ln2_rstd = take(l * bt);
-        let fch = take(l * bt * 4 * ch);
-        let fch_gelu = take(l * bt * 4 * ch);
+        let h = swiglu_hidden(ch);
+        let gate = take(l * bt * h);
+        let up = take(l * bt * h);
+        let glu = take(l * bt * h);
         let fcproj = take(l * bt * ch);
         let residual3 = take(l * bt * ch);
         let lnf = take(bt * ch);
-        let lnf_mean = take(bt);
         let lnf_rstd = take(bt);
         let logits = take(bt * v);
         let probs = take(bt * v);
         let losses = take(bt);
         Self {
-            encoded, ln1, ln1_mean, ln1_rstd, qkv, atty, preatt, att, attproj,
-            residual2, ln2, ln2_mean, ln2_rstd, fch, fch_gelu, fcproj, residual3,
-            lnf, lnf_mean, lnf_rstd, logits, probs, losses, total: o,
+            encoded, ln1, ln1_rstd, qkv, atty, preatt, att, attproj,
+            residual2, ln2, ln2_rstd, gate, up, glu, fcproj, residual3,
+            lnf, lnf_rstd, logits, probs, losses, total: o,
         }
     }
 }
 
-/// A GPT-2-style transformer: flat params + activation arena, with matching
+/// Offsets of the dropout masks inside a dedicated `masks` buffer (separate from
+/// the activation arena so the read-only masks never alias the activations).
+/// Each mask holds the per-element keep factor (`0` or `1/(1-p)`). Dropout sites
+/// match Posaidon: token embeddings, attention weights, attn output, MLP output.
+#[derive(Clone, Copy)]
+struct MaskLayout {
+    encoded: Off,  // (B, T, C)
+    att: Off,      // (L, B, NH, T, T)
+    attproj: Off,  // (L, B, T, C)
+    fcproj: Off,   // (L, B, T, C)
+    total: usize,
+}
+
+impl MaskLayout {
+    fn new(c: &Config) -> Self {
+        let (l, ch, nh) = (c.n_layer, c.n_embd, c.n_head);
+        let (b, t) = (c.batch_size, c.block_size);
+        let bt = b * t;
+        let mut o = 0usize;
+        let mut take = |n: usize| {
+            let off = o;
+            o += n;
+            Off { off, len: n }
+        };
+        let encoded = take(bt * ch);
+        let att = take(l * b * nh * t * t);
+        let attproj = take(l * bt * ch);
+        let fcproj = take(l * bt * ch);
+        Self { encoded, att, attproj, fcproj, total: o }
+    }
+}
+
+/// A Llama-style transformer: flat params + activation arena, with matching
 /// gradient buffers for the backward pass.
 pub struct Gpt {
     pub cfg: Config,
@@ -176,8 +200,11 @@ pub struct Gpt {
     m: Vec<f32>,      // AdamW first moment, param layout
     v: Vec<f32>,      // AdamW second moment, param layout
     adam_t: u64,      // AdamW timestep
+    masks: Vec<f32>,  // dropout keep factors (filled per training step)
+    dropout: f32,     // dropout probability (0 disables dropout entirely)
     pl: ParamLayout,
     al: ActLayout,
+    ml: MaskLayout,
 }
 
 impl Gpt {
@@ -186,10 +213,11 @@ impl Gpt {
         assert!(cfg.n_embd % cfg.n_head == 0, "n_embd must divide by n_head");
         let pl = ParamLayout::new(&cfg);
         let al = ActLayout::new(&cfg);
+        let ml = MaskLayout::new(&cfg);
         let mut params = vec![0.0f32; pl.total];
 
         // Weights ~ N(0, 0.02); biases 0; LayerNorm weights 1.
-        for o in [pl.wte, pl.wpe, pl.qkvw, pl.attprojw, pl.fcw, pl.fcprojw] {
+        for o in [pl.wte, pl.qkvw, pl.attprojw, pl.w1, pl.w3, pl.w2, pl.lm_head] {
             for x in &mut params[o.range()] {
                 *x = randn(rng) * 0.02;
             }
@@ -205,7 +233,18 @@ impl Gpt {
         let gacts = vec![0.0f32; al.total];
         let m = vec![0.0f32; pl.total];
         let v = vec![0.0f32; pl.total];
-        Self { cfg, params, acts, grads, gacts, m, v, adam_t: 0, pl, al }
+        Self {
+            cfg, params, acts, grads, gacts, m, v, adam_t: 0,
+            masks: Vec::new(), dropout: 0.0, pl, al, ml,
+        }
+    }
+
+    /// Enable dropout with probability `p` (Llama/Posaidon use 0.1). Allocates the
+    /// mask buffer. Dropout is applied only by `forward_train`/`backward`; plain
+    /// `forward` (eval, sampling, gradient check) stays deterministic.
+    pub fn set_dropout(&mut self, p: f32) {
+        self.dropout = p;
+        self.masks = if p > 0.0 { vec![1.0f32; self.ml.total] } else { Vec::new() };
     }
 
     pub fn num_params(&self) -> usize {
@@ -233,7 +272,33 @@ impl Gpt {
     /// cross-entropy `losses` and returns the mean loss over `B*T`. Activations
     /// are stored in the f32 arena for the Phase-5 backward.
     pub fn forward(&mut self, ids: &[u16], targets: Option<&[u16]>) -> Option<f32> {
-        forward_into::<f32>(&self.cfg, &self.params, &mut self.acts, ids, targets)
+        forward_into::<f32>(&self.cfg, &self.params, &mut self.acts, ids, targets, None)
+    }
+
+    /// Training forward: samples fresh dropout masks (when dropout is enabled) and
+    /// applies them. Must be paired with `backward`, which reuses these masks.
+    pub fn forward_train<R: Rng>(
+        &mut self,
+        ids: &[u16],
+        targets: Option<&[u16]>,
+        rng: &mut R,
+    ) -> Option<f32> {
+        if self.dropout > 0.0 {
+            self.fill_masks(rng);
+            forward_into::<f32>(&self.cfg, &self.params, &mut self.acts, ids, targets, Some(&self.masks))
+        } else {
+            forward_into::<f32>(&self.cfg, &self.params, &mut self.acts, ids, targets, None)
+        }
+    }
+
+    /// Sample fresh Bernoulli(keep) dropout masks scaled by `1/keep` (inverted
+    /// dropout), so the expected activation is unchanged and eval needs no rescale.
+    fn fill_masks<R: Rng>(&mut self, rng: &mut R) {
+        let keep = 1.0 - self.dropout;
+        let scale = 1.0 / keep;
+        for m in &mut self.masks {
+            *m = if rng.r#gen::<f32>() < keep { scale } else { 0.0 };
+        }
     }
 
     /// Recompute only the scalar loss in f64 (params cast to f64, fresh f64
@@ -242,7 +307,7 @@ impl Gpt {
     pub fn loss_f64(&self, ids: &[u16], targets: &[u16]) -> f64 {
         let params: Vec<f64> = self.params.iter().map(|&x| x as f64).collect();
         let mut acts = vec![0.0f64; self.al.total];
-        forward_into::<f64>(&self.cfg, &params, &mut acts, ids, Some(targets)).unwrap()
+        forward_into::<f64>(&self.cfg, &params, &mut acts, ids, Some(targets), None).unwrap()
     }
 
     /// Analytic gradient of the loss w.r.t. flat parameter `i` from the last
@@ -257,29 +322,24 @@ impl Gpt {
         let p = &self.pl;
         vec![
             ("wte", p.wte.off, p.wte.len),
-            ("wpe", p.wpe.off, p.wpe.len),
             ("ln1w", p.ln1w.off, p.ln1w.len),
-            ("ln1b", p.ln1b.off, p.ln1b.len),
             ("qkvw", p.qkvw.off, p.qkvw.len),
-            ("qkvb", p.qkvb.off, p.qkvb.len),
             ("attprojw", p.attprojw.off, p.attprojw.len),
-            ("attprojb", p.attprojb.off, p.attprojb.len),
             ("ln2w", p.ln2w.off, p.ln2w.len),
-            ("ln2b", p.ln2b.off, p.ln2b.len),
-            ("fcw", p.fcw.off, p.fcw.len),
-            ("fcb", p.fcb.off, p.fcb.len),
-            ("fcprojw", p.fcprojw.off, p.fcprojw.len),
-            ("fcprojb", p.fcprojb.off, p.fcprojb.len),
+            ("w1", p.w1.off, p.w1.len),
+            ("w3", p.w3.off, p.w3.len),
+            ("w2", p.w2.off, p.w2.len),
             ("lnfw", p.lnfw.off, p.lnfw.len),
-            ("lnfb", p.lnfb.off, p.lnfb.len),
+            ("lm_head", p.lm_head.off, p.lm_head.len),
         ]
     }
 
     /// Backward pass. Requires a prior `forward(ids, Some(targets))`; fills the
     /// f32 `grads` (param) and `gacts` (activation) buffers from zero.
     pub fn backward(&mut self, ids: &[u16], targets: &[u16]) {
+        let masks = if self.dropout > 0.0 { Some(self.masks.as_slice()) } else { None };
         backward_into::<f32>(
-            &self.cfg, &self.params, &self.acts, &mut self.grads, &mut self.gacts, ids, targets,
+            &self.cfg, &self.params, &self.acts, &mut self.grads, &mut self.gacts, ids, targets, masks,
         );
     }
 
@@ -290,10 +350,10 @@ impl Gpt {
     pub fn grads_f64(&self, ids: &[u16], targets: &[u16]) -> Vec<f64> {
         let params: Vec<f64> = self.params.iter().map(|&x| x as f64).collect();
         let mut acts = vec![0.0f64; self.al.total];
-        forward_into::<f64>(&self.cfg, &params, &mut acts, ids, Some(targets));
+        forward_into::<f64>(&self.cfg, &params, &mut acts, ids, Some(targets), None);
         let mut grads = vec![0.0f64; self.pl.total];
         let mut gacts = vec![0.0f64; self.al.total];
-        backward_into::<f64>(&self.cfg, &params, &acts, &mut grads, &mut gacts, ids, targets);
+        backward_into::<f64>(&self.cfg, &params, &acts, &mut grads, &mut gacts, ids, targets, None);
         grads
     }
 
@@ -348,13 +408,16 @@ fn backward_into<F: Float + Send + Sync>(
     gacts: &mut [F],
     ids: &[u16],
     targets: &[u16],
+    masks: Option<&[F]>,
 ) {
     let (b, t, ch, nh, v, nl) = (
         cfg.batch_size, cfg.block_size, cfg.n_embd, cfg.n_head, cfg.vocab_size, cfg.n_layer,
     );
     let bt = b * t;
+    let hidden = swiglu_hidden(ch);
     let pl = ParamLayout::new(cfg);
     let al = ActLayout::new(cfg);
+    let ml = MaskLayout::new(cfg);
 
     for x in grads.iter_mut() {
         *x = F::zero();
@@ -367,17 +430,17 @@ fn backward_into<F: Float + Send + Sync>(
     let dmean = F::one() / cast::<F>(bt as f64);
 
     crossentropy_softmax_backward(gacts, al.logits.off, acts, al.probs.off, targets, bt, v, dmean);
-    // lm_head (logits = lnf @ wte^T, tied weight, no bias)
+    // lm_head (logits = lnf @ lm_head^T, untied, no bias)
     linear_backward(
         gacts, al.lnf.off, al.logits.off,
-        grads, pl.wte.off, None,
-        acts, al.lnf.off, params, pl.wte.off, bt, ch, v,
+        grads, pl.lm_head.off, None,
+        acts, al.lnf.off, params, pl.lm_head.off, bt, ch, v,
     );
     let resf_off = al.residual3.off + (nl - 1) * bt * ch;
-    layernorm_backward(
+    rmsnorm_backward(
         gacts, resf_off, al.lnf.off,
-        grads, pl.lnfw.off, pl.lnfb.off,
-        acts, resf_off, al.lnf_mean.off, al.lnf_rstd.off,
+        grads, pl.lnfw.off,
+        acts, resf_off, al.lnf_rstd.off,
         params, pl.lnfw.off, bt, ch,
     );
 
@@ -390,7 +453,6 @@ fn backward_into<F: Float + Send + Sync>(
 
         // activation (and activation-grad) offsets
         let ln1_off = al.ln1.off + l * bt * ch;
-        let ln1_mean_off = al.ln1_mean.off + l * bt;
         let ln1_rstd_off = al.ln1_rstd.off + l * bt;
         let qkv_off = al.qkv.off + l * bt * 3 * ch;
         let atty_off = al.atty.off + l * bt * ch;
@@ -399,78 +461,91 @@ fn backward_into<F: Float + Send + Sync>(
         let attproj_off = al.attproj.off + l * bt * ch;
         let residual2_off = al.residual2.off + l * bt * ch;
         let ln2_off = al.ln2.off + l * bt * ch;
-        let ln2_mean_off = al.ln2_mean.off + l * bt;
         let ln2_rstd_off = al.ln2_rstd.off + l * bt;
-        let fch_off = al.fch.off + l * bt * 4 * ch;
-        let fch_gelu_off = al.fch_gelu.off + l * bt * 4 * ch;
+        let gate_off = al.gate.off + l * bt * hidden;
+        let up_off = al.up.off + l * bt * hidden;
+        let glu_off = al.glu.off + l * bt * hidden;
         let fcproj_off = al.fcproj.off + l * bt * ch;
         let residual3_off = al.residual3.off + l * bt * ch;
 
         // parameter (and param-grad) offsets
         let ln1w_off = pl.ln1w.off + l * ch;
-        let ln1b_off = pl.ln1b.off + l * ch;
         let qkvw_off = pl.qkvw.off + l * 3 * ch * ch;
-        let qkvb_off = pl.qkvb.off + l * 3 * ch;
         let attprojw_off = pl.attprojw.off + l * ch * ch;
-        let attprojb_off = pl.attprojb.off + l * ch;
         let ln2w_off = pl.ln2w.off + l * ch;
-        let ln2b_off = pl.ln2b.off + l * ch;
-        let fcw_off = pl.fcw.off + l * 4 * ch * ch;
-        let fcb_off = pl.fcb.off + l * 4 * ch;
-        let fcprojw_off = pl.fcprojw.off + l * ch * 4 * ch;
-        let fcprojb_off = pl.fcprojb.off + l * ch;
+        let w1_off = pl.w1.off + l * hidden * ch;
+        let w3_off = pl.w3.off + l * hidden * ch;
+        let w2_off = pl.w2.off + l * ch * hidden;
 
         // residual3 = residual2 + fcproj
         residual_backward(gacts, residual2_off, fcproj_off, residual3_off, bt * ch);
-        // fcproj = fch_gelu @ fcprojw^T + fcprojb
+        if let Some(m) = masks {
+            apply_dropout(gacts, fcproj_off, m, ml.fcproj.off + l * bt * ch, bt * ch);
+        }
+        // fcproj = glu @ w2^T  (no bias)  -> dglu
         linear_backward(
-            gacts, fch_gelu_off, fcproj_off,
-            grads, fcprojw_off, Some(fcprojb_off),
-            acts, fch_gelu_off, params, fcprojw_off, bt, 4 * ch, ch,
+            gacts, glu_off, fcproj_off,
+            grads, w2_off, None,
+            acts, glu_off, params, w2_off, bt, hidden, ch,
         );
-        gelu_backward(gacts, fch_off, fch_gelu_off, acts, fch_off, bt * 4 * ch);
-        // fch = ln2 @ fcw^T + fcb
+        // glu = silu(gate) * up  -> dgate, dup
+        swiglu_backward(gacts, gate_off, up_off, glu_off, acts, gate_off, up_off, bt * hidden);
+        // gate = ln2 @ w1^T  -> accumulates d ln2
         linear_backward(
-            gacts, ln2_off, fch_off,
-            grads, fcw_off, Some(fcb_off),
-            acts, ln2_off, params, fcw_off, bt, ch, 4 * ch,
+            gacts, ln2_off, gate_off,
+            grads, w1_off, None,
+            acts, ln2_off, params, w1_off, bt, ch, hidden,
         );
-        // ln2 = layernorm(residual2)  -> accumulates into d residual2
-        layernorm_backward(
+        // up = ln2 @ w3^T  -> accumulates d ln2 (+=)
+        linear_backward(
+            gacts, ln2_off, up_off,
+            grads, w3_off, None,
+            acts, ln2_off, params, w3_off, bt, ch, hidden,
+        );
+        // ln2 = rmsnorm(residual2)  -> accumulates into d residual2
+        rmsnorm_backward(
             gacts, residual2_off, ln2_off,
-            grads, ln2w_off, ln2b_off,
-            acts, residual2_off, ln2_mean_off, ln2_rstd_off,
+            grads, ln2w_off,
+            acts, residual2_off, ln2_rstd_off,
             params, ln2w_off, bt, ch,
         );
         // residual2 = residual + attproj
         residual_backward(gacts, res_off, attproj_off, residual2_off, bt * ch);
-        // attproj = atty @ attprojw^T + attprojb
+        if let Some(m) = masks {
+            apply_dropout(gacts, attproj_off, m, ml.attproj.off + l * bt * ch, bt * ch);
+        }
+        // attproj = atty @ attprojw^T  (no bias)
         linear_backward(
             gacts, atty_off, attproj_off,
-            grads, attprojw_off, Some(attprojb_off),
+            grads, attprojw_off, None,
             acts, atty_off, params, attprojw_off, bt, ch, ch,
         );
+        let att_mask = masks.map(|m| &m[ml.att.off + l * b * nh * t * t..ml.att.off + (l + 1) * b * nh * t * t]);
         attention_backward(
             gacts, qkv_off, preatt_off, att_off, atty_off,
-            acts, qkv_off, att_off, b, t, ch, nh,
+            acts, qkv_off, att_off, b, t, ch, nh, att_mask,
         );
-        // qkv = ln1 @ qkvw^T + qkvb
+        rope_backward(gacts, qkv_off, b, t, nh, ch / nh);
+        // qkv = ln1 @ qkvw^T  (no bias)
         linear_backward(
             gacts, ln1_off, qkv_off,
-            grads, qkvw_off, Some(qkvb_off),
+            grads, qkvw_off, None,
             acts, ln1_off, params, qkvw_off, bt, ch, 3 * ch,
         );
-        // ln1 = layernorm(residual)  -> accumulates into d residual (layer input)
-        layernorm_backward(
+        // ln1 = rmsnorm(residual)  -> accumulates into d residual (layer input)
+        rmsnorm_backward(
             gacts, res_off, ln1_off,
-            grads, ln1w_off, ln1b_off,
-            acts, res_off, ln1_mean_off, ln1_rstd_off,
+            grads, ln1w_off,
+            acts, res_off, ln1_rstd_off,
             params, ln1w_off, bt, ch,
         );
     }
 
-    // encoded = wte[ids] + wpe[pos]  (wte grad accumulates on top of lm_head)
-    encoder_backward(grads, pl.wte.off, pl.wpe.off, gacts, al.encoded.off, ids, b, t, ch);
+    if let Some(m) = masks {
+        apply_dropout(gacts, al.encoded.off, m, ml.encoded.off, bt * ch);
+    }
+    // encoded = wte[ids]  (token-embedding gradient; position is RoPE, no wpe)
+    encoder_backward(grads, pl.wte.off, gacts, al.encoded.off, ids, b, t, ch);
 }
 
 /// The single forward implementation, generic over the float type so the exact
@@ -482,20 +557,23 @@ fn forward_into<F: Float + Send + Sync>(
     acts: &mut [F],
     ids: &[u16],
     targets: Option<&[u16]>,
+    masks: Option<&[F]>,
 ) -> Option<F> {
     let (b, t, ch, nh, v, nl) = (
         cfg.batch_size, cfg.block_size, cfg.n_embd, cfg.n_head, cfg.vocab_size, cfg.n_layer,
     );
     let bt = b * t;
+    let hidden = swiglu_hidden(ch);
+    let ml = MaskLayout::new(cfg);
     assert_eq!(ids.len(), bt, "ids must be batch_size * block_size");
 
     let pl = ParamLayout::new(cfg);
     let al = ActLayout::new(cfg);
 
-    encoder_forward(
-        acts, al.encoded.off, ids,
-        &params[pl.wte.range()], &params[pl.wpe.range()], b, t, ch,
-    );
+    encoder_forward(acts, al.encoded.off, ids, &params[pl.wte.range()], b, t, ch);
+    if let Some(m) = masks {
+        apply_dropout(acts, al.encoded.off, m, ml.encoded.off, bt * ch);
+    }
 
     for l in 0..nl {
         let res_off = if l == 0 {
@@ -506,7 +584,6 @@ fn forward_into<F: Float + Send + Sync>(
 
         // Per-layer activation offsets.
         let ln1_off = al.ln1.off + l * bt * ch;
-        let ln1_mean_off = al.ln1_mean.off + l * bt;
         let ln1_rstd_off = al.ln1_rstd.off + l * bt;
         let qkv_off = al.qkv.off + l * bt * 3 * ch;
         let atty_off = al.atty.off + l * bt * ch;
@@ -515,47 +592,52 @@ fn forward_into<F: Float + Send + Sync>(
         let attproj_off = al.attproj.off + l * bt * ch;
         let residual2_off = al.residual2.off + l * bt * ch;
         let ln2_off = al.ln2.off + l * bt * ch;
-        let ln2_mean_off = al.ln2_mean.off + l * bt;
         let ln2_rstd_off = al.ln2_rstd.off + l * bt;
-        let fch_off = al.fch.off + l * bt * 4 * ch;
-        let fch_gelu_off = al.fch_gelu.off + l * bt * 4 * ch;
+        let gate_off = al.gate.off + l * bt * hidden;
+        let up_off = al.up.off + l * bt * hidden;
+        let glu_off = al.glu.off + l * bt * hidden;
         let fcproj_off = al.fcproj.off + l * bt * ch;
         let residual3_off = al.residual3.off + l * bt * ch;
 
         // Per-layer parameter slices.
         let ln1w = &params[pl.ln1w.off + l * ch..pl.ln1w.off + (l + 1) * ch];
-        let ln1b = &params[pl.ln1b.off + l * ch..pl.ln1b.off + (l + 1) * ch];
         let qkvw = &params[pl.qkvw.off + l * 3 * ch * ch..pl.qkvw.off + (l + 1) * 3 * ch * ch];
-        let qkvb = &params[pl.qkvb.off + l * 3 * ch..pl.qkvb.off + (l + 1) * 3 * ch];
         let attprojw = &params[pl.attprojw.off + l * ch * ch..pl.attprojw.off + (l + 1) * ch * ch];
-        let attprojb = &params[pl.attprojb.off + l * ch..pl.attprojb.off + (l + 1) * ch];
         let ln2w = &params[pl.ln2w.off + l * ch..pl.ln2w.off + (l + 1) * ch];
-        let ln2b = &params[pl.ln2b.off + l * ch..pl.ln2b.off + (l + 1) * ch];
-        let fcw = &params[pl.fcw.off + l * 4 * ch * ch..pl.fcw.off + (l + 1) * 4 * ch * ch];
-        let fcb = &params[pl.fcb.off + l * 4 * ch..pl.fcb.off + (l + 1) * 4 * ch];
-        let fcprojw =
-            &params[pl.fcprojw.off + l * ch * 4 * ch..pl.fcprojw.off + (l + 1) * ch * 4 * ch];
-        let fcprojb = &params[pl.fcprojb.off + l * ch..pl.fcprojb.off + (l + 1) * ch];
+        let w1 = &params[pl.w1.off + l * hidden * ch..pl.w1.off + (l + 1) * hidden * ch];
+        let w3 = &params[pl.w3.off + l * hidden * ch..pl.w3.off + (l + 1) * hidden * ch];
+        let w2 = &params[pl.w2.off + l * ch * hidden..pl.w2.off + (l + 1) * ch * hidden];
 
-        layernorm_forward(acts, ln1_off, ln1_mean_off, ln1_rstd_off, res_off, ln1w, ln1b, bt, ch);
-        linear(acts, qkv_off, ln1_off, qkvw, Some(qkvb), bt, ch, 3 * ch);
-        attention_forward(acts, atty_off, preatt_off, att_off, qkv_off, b, t, ch, nh);
-        linear(acts, attproj_off, atty_off, attprojw, Some(attprojb), bt, ch, ch);
+        let att_mask = masks.map(|m| &m[ml.att.off + l * b * nh * t * t..ml.att.off + (l + 1) * b * nh * t * t]);
+
+        rmsnorm_forward(acts, ln1_off, ln1_rstd_off, res_off, ln1w, bt, ch);
+        linear(acts, qkv_off, ln1_off, qkvw, None, bt, ch, 3 * ch);
+        rope_forward(acts, qkv_off, b, t, nh, ch / nh);
+        attention_forward(acts, atty_off, preatt_off, att_off, qkv_off, b, t, ch, nh, att_mask);
+        linear(acts, attproj_off, atty_off, attprojw, None, bt, ch, ch);
+        if let Some(m) = masks {
+            apply_dropout(acts, attproj_off, m, ml.attproj.off + l * bt * ch, bt * ch);
+        }
         residual_forward(acts, residual2_off, res_off, attproj_off, bt * ch);
-        layernorm_forward(acts, ln2_off, ln2_mean_off, ln2_rstd_off, residual2_off, ln2w, ln2b, bt, ch);
-        linear(acts, fch_off, ln2_off, fcw, Some(fcb), bt, ch, 4 * ch);
-        gelu_forward(acts, fch_gelu_off, fch_off, bt * 4 * ch);
-        linear(acts, fcproj_off, fch_gelu_off, fcprojw, Some(fcprojb), bt, 4 * ch, ch);
+        rmsnorm_forward(acts, ln2_off, ln2_rstd_off, residual2_off, ln2w, bt, ch);
+        // SwiGLU: glu = silu(ln2 @ w1^T) * (ln2 @ w3^T);  fcproj = glu @ w2^T
+        linear(acts, gate_off, ln2_off, w1, None, bt, ch, hidden);
+        linear(acts, up_off, ln2_off, w3, None, bt, ch, hidden);
+        swiglu_forward(acts, glu_off, gate_off, up_off, bt * hidden);
+        linear(acts, fcproj_off, glu_off, w2, None, bt, hidden, ch);
+        if let Some(m) = masks {
+            apply_dropout(acts, fcproj_off, m, ml.fcproj.off + l * bt * ch, bt * ch);
+        }
         residual_forward(acts, residual3_off, residual2_off, fcproj_off, bt * ch);
     }
 
     let resf_off = al.residual3.off + (nl - 1) * bt * ch;
-    layernorm_forward(
-        acts, al.lnf.off, al.lnf_mean.off, al.lnf_rstd.off, resf_off,
-        &params[pl.lnfw.range()], &params[pl.lnfb.range()], bt, ch,
+    rmsnorm_forward(
+        acts, al.lnf.off, al.lnf_rstd.off, resf_off,
+        &params[pl.lnfw.range()], bt, ch,
     );
-    // lm_head is weight-tied to wte: logits = lnf @ wte^T, no bias.
-    linear(acts, al.logits.off, al.lnf.off, &params[pl.wte.range()], None, bt, ch, v);
+    // lm_head: logits = lnf @ lm_head^T, no bias (untied from wte).
+    linear(acts, al.logits.off, al.lnf.off, &params[pl.lm_head.range()], None, bt, ch, v);
 
     targets.map(|targets| {
         assert_eq!(targets.len(), bt, "targets must be batch_size * block_size");
@@ -576,8 +658,6 @@ fn randn<R: Rng>(rng: &mut R) -> f32 {
     (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
 }
 
-const GELU_SCALE: f64 = 0.797_884_560_802_865_4; // sqrt(2/pi)
-
 /// Cast an f64 literal into the generic float type `F`.
 #[inline]
 fn cast<F: Float>(x: f64) -> F {
@@ -589,30 +669,95 @@ fn encoder_forward<F: Float>(
     out_off: usize,
     ids: &[u16],
     wte: &[F],
-    wpe: &[F],
     b: usize,
     t: usize,
     c: usize,
 ) {
+    // Token embedding only; position enters via RoPE inside attention.
     for bi in 0..b {
         for ti in 0..t {
             let ix = ids[bi * t + ti] as usize;
             let o = out_off + (bi * t + ti) * c;
             for ci in 0..c {
-                acts[o + ci] = wte[ix * c + ci] + wpe[ti * c + ci];
+                acts[o + ci] = wte[ix * c + ci];
             }
         }
     }
 }
 
-fn layernorm_forward<F: Float>(
+/// Rotary position embedding (Llama / MLX non-traditional convention), applied
+/// in place to the q and k of each head in the packed `[B, T, 3C]` qkv buffer
+/// (q at head offset, k at `C +` head offset; v untouched). For frequency index
+/// `j` in `0..hs/2` the pair `(x[j], x[j+hs/2])` is rotated by
+/// `angle = pos · 10000^(-2j/hs)`, so position enters multiplicatively instead
+/// of via a learned table.
+fn rope_forward<F: Float>(acts: &mut [F], qkv_off: usize, b: usize, t: usize, nh: usize, hs: usize) {
+    debug_assert!(hs % 2 == 0, "RoPE needs an even head size");
+    let c = nh * hs;
+    let c3 = 3 * c;
+    let half = hs / 2;
+    let base = cast::<F>(10000.0);
+    for bi in 0..b {
+        for ti in 0..t {
+            let pos = cast::<F>(ti as f64);
+            let tok = qkv_off + (bi * t + ti) * c3;
+            for h in 0..nh {
+                let q = tok + h * hs;
+                let k = tok + c + h * hs;
+                for j in 0..half {
+                    let inv_freq = base.powf(cast::<F>(-2.0 * j as f64 / hs as f64));
+                    let theta = pos * inv_freq;
+                    let (s, co) = (theta.sin(), theta.cos());
+                    for off in [q, k] {
+                        let x1 = acts[off + j];
+                        let x2 = acts[off + j + half];
+                        acts[off + j] = x1 * co - x2 * s;
+                        acts[off + j + half] = x1 * s + x2 * co;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Backward of RoPE. The rotation is orthogonal, so the gradient is rotated by
+/// the transpose (by `-angle`). Operates in place on the dq/dk grads in `gacts`.
+fn rope_backward<F: Float>(gacts: &mut [F], qkv_off: usize, b: usize, t: usize, nh: usize, hs: usize) {
+    let c = nh * hs;
+    let c3 = 3 * c;
+    let half = hs / 2;
+    let base = cast::<F>(10000.0);
+    for bi in 0..b {
+        for ti in 0..t {
+            let pos = cast::<F>(ti as f64);
+            let tok = qkv_off + (bi * t + ti) * c3;
+            for h in 0..nh {
+                let q = tok + h * hs;
+                let k = tok + c + h * hs;
+                for j in 0..half {
+                    let inv_freq = base.powf(cast::<F>(-2.0 * j as f64 / hs as f64));
+                    let theta = pos * inv_freq;
+                    let (s, co) = (theta.sin(), theta.cos());
+                    for off in [q, k] {
+                        let d1 = gacts[off + j];
+                        let d2 = gacts[off + j + half];
+                        gacts[off + j] = d1 * co + d2 * s;
+                        gacts[off + j + half] = -d1 * s + d2 * co;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// RMSNorm (Llama): `out = x · rsqrt(mean(x²)+eps) · weight`. No mean-centering,
+/// no bias. Caches `rstd = rsqrt(mean(x²)+eps)` per row for the backward.
+fn rmsnorm_forward<F: Float>(
     acts: &mut [F],
     out_off: usize,
-    mean_off: usize,
     rstd_off: usize,
     inp_off: usize,
     weight: &[F],
-    bias: &[F],
     n: usize,
     c: usize,
 ) {
@@ -620,24 +765,16 @@ fn layernorm_forward<F: Float>(
     let cf = cast::<F>(c as f64);
     for r in 0..n {
         let base = inp_off + r * c;
-        let mut m = F::zero();
+        let mut ms = F::zero();
         for i in 0..c {
-            m = m + acts[base + i];
+            ms = ms + acts[base + i] * acts[base + i];
         }
-        m = m / cf;
-        let mut var = F::zero();
-        for i in 0..c {
-            let d = acts[base + i] - m;
-            var = var + d * d;
-        }
-        var = var / cf;
-        let rstd = F::one() / (var + eps).sqrt();
+        ms = ms / cf;
+        let rstd = F::one() / (ms + eps).sqrt();
         let ob = out_off + r * c;
         for i in 0..c {
-            let norm = (acts[base + i] - m) * rstd;
-            acts[ob + i] = norm * weight[i] + bias[i];
+            acts[ob + i] = acts[base + i] * rstd * weight[i];
         }
-        acts[mean_off + r] = m;
         acts[rstd_off + r] = rstd;
     }
 }
@@ -707,6 +844,16 @@ fn linear<F: Float + Send + Sync>(
     matmul_forward(out, inp, weight, bias, n, c, oc);
 }
 
+/// Apply (or undo, in backward) a precomputed dropout keep-mask in place: multiply
+/// the `n` activations (or their gradients) at `x_off` by the mask at `m_off`. The
+/// mask lives in a separate buffer, so the read and write never alias.
+fn apply_dropout<F: Float + Send + Sync>(acts: &mut [F], x_off: usize, mask: &[F], m_off: usize, n: usize) {
+    acts[x_off..x_off + n]
+        .par_iter_mut()
+        .zip(mask[m_off..m_off + n].par_iter())
+        .for_each(|(x, &m)| *x = *x * m);
+}
+
 /// Causal multi-head self-attention. `inp` is the packed qkv `[B, T, 3C]`.
 /// Parallel over the batch dimension: each `bi` writes disjoint regions of
 /// `out`/`preatt`/`att` and only reads `inp`, so the math is identical to the
@@ -721,6 +868,7 @@ fn attention_forward<F: Float + Send + Sync>(
     t: usize,
     c: usize,
     nh: usize,
+    att_mask: Option<&[F]>,
 ) {
     let hs = c / nh;
     let scale = F::one() / cast::<F>(hs as f64).sqrt();
@@ -739,7 +887,9 @@ fn attention_forward<F: Float + Send + Sync>(
         .zip(preatt.par_chunks_mut(nh * t * t))
         .zip(att.par_chunks_mut(nh * t * t))
         .zip(inp.par_chunks(t * c3))
-        .for_each(|(((out_b, pre_b), att_b), inp_b)| {
+        .enumerate()
+        .for_each(|(bi, (((out_b, pre_b), att_b), inp_b))| {
+            let mask_base = bi * nh * t * t; // into att_mask, if any
             for h in 0..nh {
                 for ti in 0..t {
                     let q_base = ti * c3 + h * hs;
@@ -784,7 +934,10 @@ fn attention_forward<F: Float + Send + Sync>(
                     }
                     for t2 in 0..=ti {
                         let v_base = t2 * c3 + 2 * c + h * hs;
-                        let a = att_b[att_base + t2];
+                        // dropout on the (cached pre-dropout) attention weight
+                        let a = att_mask.map_or(att_b[att_base + t2], |m| {
+                            att_b[att_base + t2] * m[mask_base + att_base + t2]
+                        });
                         for i in 0..hs {
                             out_b[o_base + i] = out_b[o_base + i] + a * inp_b[v_base + i];
                         }
@@ -863,14 +1016,15 @@ fn crossentropy_forward<F: Float>(
     }
 }
 
-/// Tanh-approximation GELU (the GPT-2 variant).
-fn gelu_forward<F: Float + Send + Sync>(acts: &mut [F], out_off: usize, inp_off: usize, n: usize) {
-    // arena order: inp(fch) < out(fch_gelu)
-    let (inp, out) = disjoint_mut(acts, inp_off, n, out_off, n);
-    out.par_iter_mut().zip(inp.par_iter()).for_each(|(o, &x)| {
-        let cube = cast::<F>(0.044715) * x * x * x;
-        *o = cast::<F>(0.5) * x * (F::one() + (cast::<F>(GELU_SCALE) * (x + cube)).tanh());
-    });
+/// SwiGLU gate: `glu = silu(gate) · up`, with `silu(z) = z·σ(z)`. `gate`, `up`,
+/// `glu` are distinct arena tensors (gate read, up read, glu written).
+fn swiglu_forward<F: Float>(acts: &mut [F], glu_off: usize, gate_off: usize, up_off: usize, n: usize) {
+    for i in 0..n {
+        let g = acts[gate_off + i];
+        let u = acts[up_off + i];
+        let silu = g / (F::one() + (-g).exp());
+        acts[glu_off + i] = silu * u;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1000,16 +1154,17 @@ fn linear_backward<F: Float + Send + Sync>(
 }
 
 /// Backward of LayerNorm. Accumulates `dinp`, `dweight`, `dbias`.
-fn layernorm_backward<F: Float>(
+/// Backward of RMSNorm. Like LayerNorm's but without the mean-centering term:
+/// `dx_k = rstd·(dnorm_k − norm_k·⟨dnorm·norm⟩)`, with `norm = x·rstd`,
+/// `dnorm = weight·dout`. Accumulates `dinp` and `dweight` (no bias).
+fn rmsnorm_backward<F: Float>(
     gacts: &mut [F],
     dinp_off: usize,
     dout_off: usize,
     grads: &mut [F],
     dweight_off: usize,
-    dbias_off: usize,
     acts: &[F],
     inp_off: usize,
-    mean_off: usize,
     rstd_off: usize,
     params: &[F],
     weight_off: usize,
@@ -1018,57 +1173,53 @@ fn layernorm_backward<F: Float>(
 ) {
     let cf = cast::<F>(c as f64);
     for r in 0..n {
-        let mean = acts[mean_off + r];
         let rstd = acts[rstd_off + r];
         let ib = inp_off + r * c;
         let ob = dout_off + r * c;
         let dib = dinp_off + r * c;
 
-        // two reduction terms over the row
-        let mut dnorm_mean = F::zero();
+        // single reduction term over the row
         let mut dnorm_norm_mean = F::zero();
         for i in 0..c {
-            let norm = (acts[ib + i] - mean) * rstd;
+            let norm = acts[ib + i] * rstd;
             let dnorm_i = params[weight_off + i] * gacts[ob + i];
-            dnorm_mean = dnorm_mean + dnorm_i;
             dnorm_norm_mean = dnorm_norm_mean + dnorm_i * norm;
         }
-        dnorm_mean = dnorm_mean / cf;
         dnorm_norm_mean = dnorm_norm_mean / cf;
 
         for i in 0..c {
-            let norm = (acts[ib + i] - mean) * rstd;
+            let norm = acts[ib + i] * rstd;
             let dnorm_i = params[weight_off + i] * gacts[ob + i];
-            grads[dbias_off + i] = grads[dbias_off + i] + gacts[ob + i];
             grads[dweight_off + i] = grads[dweight_off + i] + norm * gacts[ob + i];
-            let dval = (dnorm_i - dnorm_mean - norm * dnorm_norm_mean) * rstd;
+            let dval = (dnorm_i - norm * dnorm_norm_mean) * rstd;
             gacts[dib + i] = gacts[dib + i] + dval;
         }
     }
 }
 
-/// Backward of tanh-GELU. Accumulates `dinp`.
-fn gelu_backward<F: Float + Send + Sync>(gacts: &mut [F], dinp_off: usize, dout_off: usize, acts: &[F], inp_off: usize, n: usize) {
-    let s = cast::<F>(GELU_SCALE);
-    let half = cast::<F>(0.5);
-    let a = cast::<F>(0.044715);
-    let three_a = cast::<F>(3.0 * 0.044715);
-    let inp = &acts[inp_off..inp_off + n];
-    // arena order: dinp(fch) < dout(fch_gelu)
-    let (dinp, dout) = disjoint_mut(gacts, dinp_off, n, dout_off, n);
-    dinp.par_iter_mut()
-        .zip(dout.par_iter())
-        .zip(inp.par_iter())
-        .for_each(|((di, &dou), &x)| {
-            let cube = a * x * x * x;
-            let arg = s * (x + cube);
-            let tanh_out = arg.tanh();
-            let cosh = arg.cosh();
-            let sech2 = F::one() / (cosh * cosh);
-            let local =
-                half * (F::one() + tanh_out) + x * half * sech2 * s * (F::one() + three_a * x * x);
-            *di = *di + local * dou;
-        });
+/// Backward of SwiGLU. From `dglu` (grad of `glu = silu(gate)·up`) produce
+/// `dgate` and `dup`. `silu'(g) = σ(g)·(1 + g·(1−σ(g)))`. Writes dgate/dup
+/// (each produced only here).
+fn swiglu_backward<F: Float>(
+    gacts: &mut [F],
+    dgate_off: usize,
+    dup_off: usize,
+    dglu_off: usize,
+    acts: &[F],
+    gate_off: usize,
+    up_off: usize,
+    n: usize,
+) {
+    for i in 0..n {
+        let g = acts[gate_off + i];
+        let u = acts[up_off + i];
+        let sig = F::one() / (F::one() + (-g).exp());
+        let silu = g * sig;
+        let dsilu = sig * (F::one() + g * (F::one() - sig));
+        let dglu = gacts[dglu_off + i];
+        gacts[dgate_off + i] = dglu * u * dsilu;
+        gacts[dup_off + i] = dglu * silu;
+    }
 }
 
 /// Backward of a residual add: both inputs get the upstream gradient.
@@ -1095,6 +1246,7 @@ fn attention_backward<F: Float + Send + Sync>(
     t: usize,
     c: usize,
     nh: usize,
+    att_mask: Option<&[F]>,
 ) {
     let hs = c / nh;
     let scale = F::one() / cast::<F>(hs as f64).sqrt();
@@ -1117,6 +1269,7 @@ fn attention_backward<F: Float + Send + Sync>(
         .for_each(|(bi, (((dinp_b, dout_b), dpreatt_b), datt_b))| {
             let att_bi = att_off + bi * nh * t * t;
             let inp_bi = inp_off + bi * t * c3;
+            let mask_bi = bi * nh * t * t; // into att_mask, if any
             for h in 0..nh {
                 for ti in 0..t {
                     let att_base = att_bi + (h * t + ti) * t;
@@ -1124,16 +1277,21 @@ fn attention_backward<F: Float + Send + Sync>(
                     let dpreatt_base = datt_base;
                     let dout_base = ti * c + h * hs;
 
-                    // backward through the value accumulation -> datt and dvalue
+                    // backward through value accumulation + attn-weight dropout:
+                    // dvalue uses the post-dropout weight; datt becomes d(att_sm).
                     for t2 in 0..=ti {
                         let v_base = inp_bi + t2 * c3 + 2 * c + h * hs;
                         let dv_base = t2 * c3 + 2 * c + h * hs;
+                        let m2 = att_mask.map_or(F::one(), |m| m[mask_bi + datt_base + t2]);
+                        let att_do = acts[att_base + t2] * m2; // post-dropout weight
                         for i in 0..hs {
                             datt_b[datt_base + t2] =
                                 datt_b[datt_base + t2] + acts[v_base + i] * dout_b[dout_base + i];
                             dinp_b[dv_base + i] =
-                                dinp_b[dv_base + i] + acts[att_base + t2] * dout_b[dout_base + i];
+                                dinp_b[dv_base + i] + att_do * dout_b[dout_base + i];
                         }
+                        // datt held d(att_do); fold the dropout mask -> d(att_sm)
+                        datt_b[datt_base + t2] = datt_b[datt_base + t2] * m2;
                     }
                     // backward through the softmax: dpreatt = (diag(att) - att att^T) datt
                     for t2 in 0..=ti {
@@ -1165,7 +1323,6 @@ fn attention_backward<F: Float + Send + Sync>(
 fn encoder_backward<F: Float>(
     grads: &mut [F],
     dwte_off: usize,
-    dwpe_off: usize,
     gacts: &[F],
     dout_off: usize,
     ids: &[u16],
@@ -1179,7 +1336,6 @@ fn encoder_backward<F: Float>(
             let o = dout_off + (bi * t + ti) * c;
             for ci in 0..c {
                 grads[dwte_off + ix * c + ci] = grads[dwte_off + ix * c + ci] + gacts[o + ci];
-                grads[dwpe_off + ti * c + ci] = grads[dwpe_off + ti * c + ci] + gacts[o + ci];
             }
         }
     }
@@ -1264,5 +1420,59 @@ mod tests {
             last < first * 0.1,
             "loss did not drop enough: {first} -> {last}"
         );
+    }
+
+    /// Gradient-check the dropout path with a *fixed* f64 mask (so the forward is
+    /// deterministic and finite differences are valid). Exercises all four dropout
+    /// sites including attention-weight dropout.
+    #[test]
+    fn dropout_backward_gradient_check() {
+        let cfg = Config {
+            n_layer: 2, n_head: 2, n_embd: 16, block_size: 6, vocab_size: 32, batch_size: 2,
+        };
+        let mut rng = StdRng::seed_from_u64(123);
+        let model = Gpt::new(cfg, &mut rng);
+        let pl = ParamLayout::new(&cfg);
+        let al = ActLayout::new(&cfg);
+        let ml = MaskLayout::new(&cfg);
+        let n = cfg.batch_size * cfg.block_size;
+        let ids: Vec<u16> = (0..n).map(|i| (i % cfg.vocab_size) as u16).collect();
+        let targets: Vec<u16> = (0..n).map(|i| ((i * 7 + 1) % cfg.vocab_size) as u16).collect();
+
+        let params: Vec<f64> = (0..pl.total).map(|i| model.param(i) as f64).collect();
+        // fixed keep-mask: ~1 in 4 dropped, the rest scaled by 1/keep
+        let keep = 0.75f64;
+        let scale = 1.0 / keep;
+        let mask: Vec<f64> = (0..ml.total)
+            .map(|i| if i.wrapping_mul(2_654_435_761) % 4 == 0 { 0.0 } else { scale })
+            .collect();
+
+        let mut acts = vec![0.0f64; al.total];
+        forward_into::<f64>(&cfg, &params, &mut acts, &ids, Some(&targets), Some(&mask));
+        let mut grads = vec![0.0f64; pl.total];
+        let mut gacts = vec![0.0f64; al.total];
+        backward_into::<f64>(&cfg, &params, &acts, &mut grads, &mut gacts, &ids, &targets, Some(&mask));
+
+        let loss = |p: &[f64]| {
+            let mut a = vec![0.0f64; al.total];
+            forward_into::<f64>(&cfg, p, &mut a, &ids, Some(&targets), Some(&mask)).unwrap()
+        };
+        let eps = 1e-6;
+        let mut worst = 0.0f64;
+        for &i in &[
+            pl.wte.off, pl.qkvw.off, pl.attprojw.off, pl.w1.off, pl.w2.off,
+            pl.ln1w.off, pl.ln2w.off, pl.lm_head.off, pl.lnfw.off,
+        ] {
+            let mut pp = params.clone();
+            pp[i] = params[i] + eps;
+            let lp = loss(&pp);
+            pp[i] = params[i] - eps;
+            let lm = loss(&pp);
+            let num = (lp - lm) / (2.0 * eps);
+            let ana = grads[i];
+            let rel = (num - ana).abs() / num.abs().max(ana.abs()).max(1e-9);
+            worst = worst.max(rel);
+        }
+        assert!(worst < 1e-5, "dropout gradient check failed: {worst:e}");
     }
 }

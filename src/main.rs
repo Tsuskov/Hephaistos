@@ -52,6 +52,12 @@ pub fn matmul(out: &mut [f32], a: &[f32], b: &[f32], m: usize, k: usize, n: usiz
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Phase 8: real Llama run on the Greek corpus vs the MLX reference curve.
+    // Gated behind an env var so the default run stays the phase-0..7 demo.
+    if std::env::var("PHASE8").is_ok() {
+        return phase8();
+    }
+
     // Phase 0 sanity.
     let mut out = [0.0f32; 4];
     matmul(&mut out, &[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0], 2, 2, 2);
@@ -208,6 +214,68 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("--- seed ---\n{seed_txt}");
     println!("--- generated ---\n{gen_txt}");
 
+    Ok(())
+}
+
+/// Phase 8 — train the from-scratch Llama on the Greek corpus with the exact
+/// Posaidon hyperparameters and compare the loss trajectory to the MLX reference
+/// (`Posaidon/out_greek/train.log`). Reuses Posaidon's BPE tokenizer (vocab 2048)
+/// so the token stream matches, and splits tokens 90/10 like the reference.
+fn phase8() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use rand::SeedableRng;
+
+    const GREEK_TOK: &str = "data/greek_tokenizer.json";
+    const GREEK_CORPUS: &str = "data/greek_input.txt";
+    const GREEK_TRAIN: &str = "data/greek_train.bin";
+    const GREEK_VAL: &str = "data/greek_val.bin";
+    const GREEK_CKPT: &str = "data/greek_ckpt.bin";
+
+    let tok = tokenizers::Tokenizer::from_file(GREEK_TOK)?;
+    println!("Phase 8: Greek run | tokenizer vocab = {}", tok.get_vocab_size(true));
+
+    // Encode the whole corpus, then split tokens 90/10 (matches the reference).
+    if !(Path::new(GREEK_TRAIN).exists() && Path::new(GREEK_VAL).exists()) {
+        let text = std::fs::read_to_string(GREEK_CORPUS)?;
+        let ids = encode_ids(&tok, &text)?;
+        let split = ids.len() * 9 / 10;
+        write_u16_le(GREEK_TRAIN, &ids[..split])?;
+        write_u16_le(GREEK_VAL, &ids[split..])?;
+        println!("encoded {} tokens -> train {} / val {}", ids.len(), split, ids.len() - split);
+    }
+
+    let cfg = Config {
+        n_layer: 8,
+        n_head: 8,
+        n_embd: 384,
+        block_size: 256,
+        vocab_size: 2048,
+        batch_size: 32,
+    };
+    let mut rng = rand::rngs::StdRng::seed_from_u64(1337);
+    let mut model = Gpt::new(cfg, &mut rng);
+    model.set_dropout(0.1);
+    println!("model: {} params (reference: 15.74M)", model.num_params());
+
+    let loader = DataLoader::from_bin(GREEK_TRAIN, cfg.batch_size, cfg.block_size)?;
+    let val_loader = DataLoader::from_bin(GREEK_VAL, cfg.batch_size, cfg.block_size)?;
+
+    // Short validation run by default; override step count with PHASE8_STEPS.
+    let steps: usize = std::env::var("PHASE8_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(250);
+    let tcfg = train::TrainConfig {
+        steps,
+        lr: 3e-4,
+        weight_decay: 0.1,
+        eval_every: 50,
+        eval_batches: 5,
+        patience: 100000, // disable early stop for the validation run
+        ckpt_path: GREEK_CKPT.to_string(),
+    };
+    println!("training {steps} steps (lr 3e-4, wd 0.1, dropout 0.1)");
+    println!("MLX reference: iter250 t4.63/v5.04, iter500 t3.88/v4.46, val-min 3.97 @ 1500");
+    let t0 = std::time::Instant::now();
+    let best = train::train(&mut model, &loader, &val_loader, &mut rng, &tcfg)?;
+    let dt = t0.elapsed().as_secs_f64();
+    println!("done: {steps} steps in {dt:.1}s ({:.2} steps/s), best val {best:.4}", steps as f64 / dt);
     Ok(())
 }
 
