@@ -802,9 +802,40 @@ fn disjoint_mut<F>(
     }
 }
 
+/// Dot product with 8 independent accumulators. A plain `for` reduction is a
+/// sequential FP dependency chain that LLVM may not vectorize (reordering FP adds
+/// changes results); splitting into 8 lanes lets it emit SIMD. Sum order differs
+/// from the naive loop only in rounding — gradient-checked the same.
+#[inline]
+fn dot<F: Float>(a: &[F], b: &[F]) -> F {
+    let mut acc = [F::zero(); 8];
+    let mut ai = a.chunks_exact(8);
+    let mut bi = b.chunks_exact(8);
+    for (ac, bc) in ai.by_ref().zip(bi.by_ref()) {
+        for k in 0..8 {
+            acc[k] = acc[k] + ac[k] * bc[k];
+        }
+    }
+    let mut s = ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+    for (x, y) in ai.remainder().iter().zip(bi.remainder()) {
+        s = s + *x * *y;
+    }
+    s
+}
+
+/// Number of output rows processed together so each weight row is reused across
+/// the whole block while it (and the small input tile) sit in cache.
+const MM_ROW_BLOCK: usize = 16;
+
 /// Linear layer with weight `[OC, C]` (row = output unit): `out = inp @ W^T + b`.
-/// Parallel over output rows; each output element's dot product stays in one
-/// thread, so results are identical to the serial version.
+///
+/// Cache-blocked over input rows: the naive row-outer/output-inner loop streams
+/// the entire `[OC, C]` weight from RAM once per input row (memory-bound at
+/// scale). Here we take `MM_ROW_BLOCK` rows at a time and put the output-unit
+/// loop outermost, so each weight row is loaded once and reused across the whole
+/// block (and the small input tile stays in cache across the `oc` sweep). Every
+/// `out[r, o]` is still exactly `dot(inp_row_r, weight_row_o)` — bit-identical to
+/// the unblocked version, only the memory traffic changes.
 fn matmul_forward<F: Float + Send + Sync>(
     out: &mut [F],
     inp: &[F],
@@ -816,15 +847,16 @@ fn matmul_forward<F: Float + Send + Sync>(
 ) {
     debug_assert_eq!(out.len(), n * oc);
     debug_assert_eq!(inp.len(), n * c);
-    out.par_chunks_mut(oc).enumerate().for_each(|(r, orow)| {
-        let irow = &inp[r * c..(r + 1) * c];
+    out.par_chunks_mut(MM_ROW_BLOCK * oc).enumerate().for_each(|(blk, oblock)| {
+        let r0 = blk * MM_ROW_BLOCK;
+        let rows = oblock.len() / oc; // MM_ROW_BLOCK, except possibly the last block
         for o in 0..oc {
-            let mut val = bias.map_or(F::zero(), |b| b[o]);
             let w = &weight[o * c..(o + 1) * c];
-            for i in 0..c {
-                val = val + irow[i] * w[i];
+            let bo = bias.map_or(F::zero(), |b| b[o]);
+            for rb in 0..rows {
+                let irow = &inp[(r0 + rb) * c..(r0 + rb + 1) * c];
+                oblock[rb * oc + o] = dot(irow, w) + bo;
             }
-            orow[o] = val;
         }
     });
 }
@@ -1062,9 +1094,11 @@ fn crossentropy_softmax_backward<F: Float + Send + Sync>(
 }
 
 /// Backward of the `[OC, C]` linear. Accumulates into `dinp`, `dweight`, `dbias`
-/// (each fresh/zeroed). `dinp` is parallel over rows, the weight/bias reduction
-/// is parallel over output units, so per-element accumulation order matches the
-/// serial version.
+/// (each fresh/zeroed). Both halves are cache-blocked the same way the forward is
+/// — `dinp` over input rows (each weight row reused across the block), `dweight`
+/// over output units (each input row reused across the block) — so the large
+/// operand isn't re-streamed from RAM per row/unit. The per-element accumulation
+/// order is unchanged, so results stay bit-identical to the unblocked version.
 fn matmul_backward<F: Float + Send + Sync>(
     dinp: &mut [F],
     dout: &[F],
@@ -1076,44 +1110,57 @@ fn matmul_backward<F: Float + Send + Sync>(
     c: usize,
     oc: usize,
 ) {
-    // dinp[r,:] += sum_o dout[r,o] * weight[o,:]
-    dinp.par_chunks_mut(c).enumerate().for_each(|(r, dinp_r)| {
-        let dout_r = &dout[r * oc..(r + 1) * oc];
+    // dinp[r,:] += sum_o dout[r,o] * weight[o,:]  — blocked over rows.
+    dinp.par_chunks_mut(MM_ROW_BLOCK * c).enumerate().for_each(|(blk, dblock)| {
+        let r0 = blk * MM_ROW_BLOCK;
+        let rows = dblock.len() / c;
         for o in 0..oc {
-            let d = dout_r[o];
             let w = &weight[o * c..(o + 1) * c];
-            for i in 0..c {
-                dinp_r[i] = dinp_r[i] + w[i] * d;
+            for rb in 0..rows {
+                let d = dout[(r0 + rb) * oc + o];
+                let dinp_rb = &mut dblock[rb * c..(rb + 1) * c];
+                for i in 0..c {
+                    dinp_rb[i] = dinp_rb[i] + w[i] * d;
+                }
             }
         }
     });
     // dweight[o,:] += sum_r dout[r,o] * inp[r,:] ; dbias[o] += sum_r dout[r,o]
+    // — blocked over output units, so each input row is reused across the block.
     match dbias {
         Some(dbias) => {
             dweight
-                .par_chunks_mut(c)
-                .zip(dbias.par_iter_mut())
+                .par_chunks_mut(MM_ROW_BLOCK * c)
+                .zip(dbias.par_chunks_mut(MM_ROW_BLOCK))
                 .enumerate()
-                .for_each(|(o, (dw, db))| {
-                    let mut acc = F::zero();
+                .for_each(|(blk, (dwblock, dbblock))| {
+                    let o0 = blk * MM_ROW_BLOCK;
+                    let obs = dbblock.len();
                     for r in 0..n {
-                        let d = dout[r * oc + o];
                         let inp_r = &inp[r * c..(r + 1) * c];
-                        for i in 0..c {
-                            dw[i] = dw[i] + inp_r[i] * d;
+                        for ob in 0..obs {
+                            let d = dout[r * oc + o0 + ob];
+                            let dw = &mut dwblock[ob * c..(ob + 1) * c];
+                            for i in 0..c {
+                                dw[i] = dw[i] + inp_r[i] * d;
+                            }
+                            dbblock[ob] = dbblock[ob] + d;
                         }
-                        acc = acc + d;
                     }
-                    *db = *db + acc;
                 });
         }
         None => {
-            dweight.par_chunks_mut(c).enumerate().for_each(|(o, dw)| {
+            dweight.par_chunks_mut(MM_ROW_BLOCK * c).enumerate().for_each(|(blk, dwblock)| {
+                let o0 = blk * MM_ROW_BLOCK;
+                let obs = dwblock.len() / c;
                 for r in 0..n {
-                    let d = dout[r * oc + o];
                     let inp_r = &inp[r * c..(r + 1) * c];
-                    for i in 0..c {
-                        dw[i] = dw[i] + inp_r[i] * d;
+                    for ob in 0..obs {
+                        let d = dout[r * oc + o0 + ob];
+                        let dw = &mut dwblock[ob * c..(ob + 1) * c];
+                        for i in 0..c {
+                            dw[i] = dw[i] + inp_r[i] * d;
+                        }
                     }
                 }
             });
