@@ -8,10 +8,10 @@
 
 Hand-written forward *and* backward passes, every gradient verified against numerical differentiation, trained on CPU, and exported to GGUF so the result runs in `llama.cpp` and Ollama.
 
-[![CI](https://github.com/Tsuskov/Hephaistos/actions/workflows/ci.yml/badge.svg)](https://github.com/Tsuskov/Hephaistos/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-![Rust 2024](https://img.shields.io/badge/rust-edition_2024-orange.svg)
-![Built from scratch](https://img.shields.io/badge/autograd-none-blueviolet.svg)
+[![CI](https://img.shields.io/github/actions/workflow/status/Tsuskov/Hephaistos/ci.yml?branch=main&style=flat-square&label=ci)](https://github.com/Tsuskov/Hephaistos/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-edition_2024-orange?style=flat-square&logo=rust&logoColor=white)](Cargo.toml)
+![Autograd](https://img.shields.io/badge/autograd-none-555?style=flat-square)
 
 </div>
 
@@ -27,12 +27,12 @@ The named modules build on each other in numbered phases (you can see them in th
 
 ## Why it's interesting
 
-- 🔨 **Backprop by hand, then *proved* correct.** Before a single line of backward code was trusted, a gradient-check harness was built — the "truth machine." Every analytic gradient is compared against an `f64` central-difference estimate. *"Loss goes down" does not prove gradients are right; matching numerical gradients does.*
-- 🧮 **One implementation, two precisions.** The forward and backward passes are generic over the float type. The real model runs in `f32`; the gradient checker re-runs the *exact same code* in `f64` so numerical round-off can't hide a bug.
-- 🏛️ **A genuine Llama block**, not a toy: token embedding → RMSNorm → RoPE attention → RMSNorm → SwiGLU MLP, residual stream throughout, all biases dropped the way Llama does.
-- ⚡ **Honest CPU performance.** A cache-blocked matmul and an 8-lane dot product let the compiler emit SIMD, and `rayon` parallelizes over rows and the batch — while staying **bit-identical** to the naive reference loop.
-- 🤝 **It leaves the sandbox.** The trained checkpoint is exported as a llama-architecture **GGUF** (RoPE weights permuted to GGUF's interleaved layout, byte-level BPE tokenizer embedded), so it runs in `llama.cpp` and Ollama.
-- ✅ **Trustworthy by construction.** `cargo test` runs the full gradient-check suite on every commit (see CI).
+- **Backprop by hand, then *proved* correct.** Before a single line of backward code was trusted, a gradient-check harness was built — the "truth machine." Every analytic gradient is compared against an `f64` central-difference estimate. *"Loss goes down" does not prove gradients are right; matching numerical gradients does.*
+- **One implementation, two precisions.** The forward and backward passes are generic over the float type. The real model runs in `f32`; the gradient checker re-runs the *exact same code* in `f64` so numerical round-off can't hide a bug.
+- **A genuine Llama block**, not a toy: token embedding → RMSNorm → RoPE attention → RMSNorm → SwiGLU MLP, residual stream throughout, all biases dropped the way Llama does.
+- **Honest CPU performance.** A cache-blocked matmul and an 8-lane dot product let the compiler emit SIMD, and `rayon` parallelizes over rows and the batch — while staying **bit-identical** to the naive reference loop.
+- **It leaves the sandbox.** The trained checkpoint is exported as a llama-architecture **GGUF** (RoPE weights permuted to GGUF's interleaved layout, byte-level BPE tokenizer embedded), so it runs in `llama.cpp` and Ollama.
+- **Trustworthy by construction.** `cargo test` runs the full gradient-check suite on every commit (see CI).
 
 ## Architecture at a glance
 
@@ -77,7 +77,7 @@ Phase 4 harness: softmax+CE analytic vs numerical, max rel error = 2.13e-6
 Phase 5 gradient check (max rel error vs f64 numerical, < 1e-4 = correct):
   wte       5.48e-7    qkvw      1.99e-6    w1        1.36e-7
   lm_head   1.87e-8    ...       (every tensor checked)
-worst tensor: 1.99e-6                                # backprop is correct ✓
+worst tensor: 1.99e-6                                # backprop is correct
 
 Phase 6 training (start loss ~ln(1024) = 6.93):
 step    1: train 6.94  val 6.90
