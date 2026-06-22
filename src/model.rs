@@ -430,7 +430,7 @@ fn backward_into<F: Float + Send + Sync>(
         );
         gelu_backward(gacts, fch_off, fch_gelu_off, acts, fch_off, bt * 4 * ch);
         // fch = ln2 @ fcw^T + fcb
-        matmul_backward(
+        linear_backward(
             gacts, ln2_off, fch_off,
             grads, fcw_off, Some(fcb_off),
             acts, ln2_off, params, fcw_off, bt, ch, 4 * ch,
@@ -445,7 +445,7 @@ fn backward_into<F: Float + Send + Sync>(
         // residual2 = residual + attproj
         residual_backward(gacts, res_off, attproj_off, residual2_off, bt * ch);
         // attproj = atty @ attprojw^T + attprojb
-        matmul_backward(
+        linear_backward(
             gacts, atty_off, attproj_off,
             grads, attprojw_off, Some(attprojb_off),
             acts, atty_off, params, attprojw_off, bt, ch, ch,
@@ -455,7 +455,7 @@ fn backward_into<F: Float + Send + Sync>(
             acts, qkv_off, att_off, b, t, ch, nh,
         );
         // qkv = ln1 @ qkvw^T + qkvb
-        matmul_backward(
+        linear_backward(
             gacts, ln1_off, qkv_off,
             grads, qkvw_off, Some(qkvb_off),
             acts, ln1_off, params, qkvw_off, bt, ch, 3 * ch,
