@@ -708,7 +708,10 @@ fn linear<F: Float + Send + Sync>(
 }
 
 /// Causal multi-head self-attention. `inp` is the packed qkv `[B, T, 3C]`.
-fn attention_forward<F: Float>(
+/// Parallel over the batch dimension: each `bi` writes disjoint regions of
+/// `out`/`preatt`/`att` and only reads `inp`, so the math is identical to the
+/// serial version (no reduction is reordered across threads).
+fn attention_forward<F: Float + Send + Sync>(
     acts: &mut [F],
     out_off: usize,
     preatt_off: usize,
@@ -722,59 +725,94 @@ fn attention_forward<F: Float>(
     let hs = c / nh;
     let scale = F::one() / cast::<F>(hs as f64).sqrt();
     let c3 = 3 * c;
-    for bi in 0..b {
-        for h in 0..nh {
-            for ti in 0..t {
-                let q_base = inp_off + (bi * t + ti) * c3 + h * hs;
-                let pre_base = preatt_off + ((bi * nh + h) * t + ti) * t;
-                let att_base = att_off + ((bi * nh + h) * t + ti) * t;
+    // Arena order is inp(qkv) < out(atty) < preatt < att; carve out the four
+    // disjoint tensors so the batch loop can run in parallel.
+    let (inp, out, preatt, att) = four_disjoint_mut(
+        acts,
+        inp_off, b * t * c3,
+        out_off, b * t * c,
+        preatt_off, b * nh * t * t,
+        att_off, b * nh * t * t,
+    );
+    let inp: &[F] = inp;
+    out.par_chunks_mut(t * c)
+        .zip(preatt.par_chunks_mut(nh * t * t))
+        .zip(att.par_chunks_mut(nh * t * t))
+        .zip(inp.par_chunks(t * c3))
+        .for_each(|(((out_b, pre_b), att_b), inp_b)| {
+            for h in 0..nh {
+                for ti in 0..t {
+                    let q_base = ti * c3 + h * hs;
+                    let pre_base = (h * t + ti) * t;
+                    let att_base = pre_base;
 
-                // scores against keys at positions <= ti, tracking the max
-                let mut maxval = F::neg_infinity();
-                for t2 in 0..=ti {
-                    let k_base = inp_off + (bi * t + t2) * c3 + c + h * hs;
-                    let mut val = F::zero();
+                    // scores against keys at positions <= ti, tracking the max
+                    let mut maxval = F::neg_infinity();
+                    for t2 in 0..=ti {
+                        let k_base = t2 * c3 + c + h * hs;
+                        let mut val = F::zero();
+                        for i in 0..hs {
+                            val = val + inp_b[q_base + i] * inp_b[k_base + i];
+                        }
+                        val = val * scale;
+                        pre_b[pre_base + t2] = val;
+                        if val > maxval {
+                            maxval = val;
+                        }
+                    }
+                    // softmax over the causal window
+                    let mut sum = F::zero();
+                    for t2 in 0..=ti {
+                        let e = (pre_b[pre_base + t2] - maxval).exp();
+                        att_b[att_base + t2] = e;
+                        sum = sum + e;
+                    }
+                    let inv = if sum > F::zero() { F::one() / sum } else { F::zero() };
+                    for t2 in 0..t {
+                        if t2 <= ti {
+                            att_b[att_base + t2] = att_b[att_base + t2] * inv;
+                        } else {
+                            // upper triangle is masked out
+                            att_b[att_base + t2] = F::zero();
+                            pre_b[pre_base + t2] = F::zero();
+                        }
+                    }
+                    // weighted sum of values
+                    let o_base = ti * c + h * hs;
                     for i in 0..hs {
-                        val = val + acts[q_base + i] * acts[k_base + i];
+                        out_b[o_base + i] = F::zero();
                     }
-                    val = val * scale;
-                    acts[pre_base + t2] = val;
-                    if val > maxval {
-                        maxval = val;
-                    }
-                }
-                // softmax over the causal window
-                let mut sum = F::zero();
-                for t2 in 0..=ti {
-                    let e = (acts[pre_base + t2] - maxval).exp();
-                    acts[att_base + t2] = e;
-                    sum = sum + e;
-                }
-                let inv = if sum > F::zero() { F::one() / sum } else { F::zero() };
-                for t2 in 0..t {
-                    if t2 <= ti {
-                        acts[att_base + t2] = acts[att_base + t2] * inv;
-                    } else {
-                        // upper triangle is masked out
-                        acts[att_base + t2] = F::zero();
-                        acts[pre_base + t2] = F::zero();
-                    }
-                }
-                // weighted sum of values
-                let o_base = out_off + (bi * t + ti) * c + h * hs;
-                for i in 0..hs {
-                    acts[o_base + i] = F::zero();
-                }
-                for t2 in 0..=ti {
-                    let v_base = inp_off + (bi * t + t2) * c3 + 2 * c + h * hs;
-                    let a = acts[att_base + t2];
-                    for i in 0..hs {
-                        acts[o_base + i] = acts[o_base + i] + a * acts[v_base + i];
+                    for t2 in 0..=ti {
+                        let v_base = t2 * c3 + 2 * c + h * hs;
+                        let a = att_b[att_base + t2];
+                        for i in 0..hs {
+                            out_b[o_base + i] = out_b[o_base + i] + a * inp_b[v_base + i];
+                        }
                     }
                 }
             }
-        }
-    }
+        });
+}
+
+/// Split four mutually disjoint sub-slices out of one buffer, given in ascending
+/// offset order (each `[off, off+len)` must not overlap the next).
+fn four_disjoint_mut<F>(
+    buf: &mut [F],
+    o0: usize, l0: usize,
+    o1: usize, l1: usize,
+    o2: usize, l2: usize,
+    o3: usize, l3: usize,
+) -> (&mut [F], &mut [F], &mut [F], &mut [F]) {
+    assert!(o0 + l0 <= o1 && o1 + l1 <= o2 && o2 + l2 <= o3, "ranges overlap or out of order");
+    let (_, rest) = buf.split_at_mut(o0);
+    let (s0, rest) = rest.split_at_mut(l0);
+    let (_, rest) = rest.split_at_mut(o1 - (o0 + l0));
+    let (s1, rest) = rest.split_at_mut(l1);
+    let (_, rest) = rest.split_at_mut(o2 - (o1 + l1));
+    let (s2, rest) = rest.split_at_mut(l2);
+    let (_, rest) = rest.split_at_mut(o3 - (o2 + l2));
+    let (s3, _) = rest.split_at_mut(l3);
+    (s0, s1, s2, s3)
 }
 
 fn residual_forward<F: Float>(acts: &mut [F], out_off: usize, in1_off: usize, in2_off: usize, n: usize) {
@@ -784,27 +822,30 @@ fn residual_forward<F: Float>(acts: &mut [F], out_off: usize, in1_off: usize, in
 }
 
 /// Row-wise softmax of `logits [n, v]` into `probs [n, v]` (numerically stable).
-fn softmax_forward<F: Float>(acts: &mut [F], probs_off: usize, logits_off: usize, n: usize, v: usize) {
-    for r in 0..n {
-        let lb = logits_off + r * v;
-        let pb = probs_off + r * v;
-        let mut maxval = F::neg_infinity();
-        for i in 0..v {
-            if acts[lb + i] > maxval {
-                maxval = acts[lb + i];
+fn softmax_forward<F: Float + Send + Sync>(acts: &mut [F], probs_off: usize, logits_off: usize, n: usize, v: usize) {
+    // arena order: logits < probs
+    let (logits, probs) = disjoint_mut(acts, logits_off, n * v, probs_off, n * v);
+    probs
+        .par_chunks_mut(v)
+        .zip(logits.par_chunks(v))
+        .for_each(|(prow, lrow)| {
+            let mut maxval = F::neg_infinity();
+            for &l in lrow.iter() {
+                if l > maxval {
+                    maxval = l;
+                }
             }
-        }
-        let mut sum = F::zero();
-        for i in 0..v {
-            let e = (acts[lb + i] - maxval).exp();
-            acts[pb + i] = e;
-            sum = sum + e;
-        }
-        let inv = F::one() / sum;
-        for i in 0..v {
-            acts[pb + i] = acts[pb + i] * inv;
-        }
-    }
+            let mut sum = F::zero();
+            for i in 0..v {
+                let e = (lrow[i] - maxval).exp();
+                prow[i] = e;
+                sum = sum + e;
+            }
+            let inv = F::one() / sum;
+            for p in prow.iter_mut() {
+                *p = *p * inv;
+            }
+        });
 }
 
 /// Per-token cross-entropy `losses[r] = -ln(probs[r, target[r]])`.
@@ -823,12 +864,13 @@ fn crossentropy_forward<F: Float>(
 }
 
 /// Tanh-approximation GELU (the GPT-2 variant).
-fn gelu_forward<F: Float>(acts: &mut [F], out_off: usize, inp_off: usize, n: usize) {
-    for i in 0..n {
-        let x = acts[inp_off + i];
+fn gelu_forward<F: Float + Send + Sync>(acts: &mut [F], out_off: usize, inp_off: usize, n: usize) {
+    // arena order: inp(fch) < out(fch_gelu)
+    let (inp, out) = disjoint_mut(acts, inp_off, n, out_off, n);
+    out.par_iter_mut().zip(inp.par_iter()).for_each(|(o, &x)| {
         let cube = cast::<F>(0.044715) * x * x * x;
-        acts[out_off + i] = cast::<F>(0.5) * x * (F::one() + (cast::<F>(GELU_SCALE) * (x + cube)).tanh());
-    }
+        *o = cast::<F>(0.5) * x * (F::one() + (cast::<F>(GELU_SCALE) * (x + cube)).tanh());
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -840,7 +882,7 @@ fn gelu_forward<F: Float>(acts: &mut [F], out_off: usize, inp_off: usize, n: usi
 // ---------------------------------------------------------------------------
 
 /// Fused softmax + cross-entropy: `dlogits[r,j] += (probs[r,j] - 1{j=t}) * dmean`.
-fn crossentropy_softmax_backward<F: Float>(
+fn crossentropy_softmax_backward<F: Float + Send + Sync>(
     gacts: &mut [F],
     dlogits_off: usize,
     acts: &[F],
@@ -850,14 +892,19 @@ fn crossentropy_softmax_backward<F: Float>(
     v: usize,
     dmean: F,
 ) {
-    for r in 0..n {
-        let ix = targets[r] as usize;
-        for j in 0..v {
-            let ind = if j == ix { F::one() } else { F::zero() };
-            let g = (acts[probs_off + r * v + j] - ind) * dmean;
-            gacts[dlogits_off + r * v + j] = gacts[dlogits_off + r * v + j] + g;
-        }
-    }
+    let dlogits = &mut gacts[dlogits_off..dlogits_off + n * v];
+    let probs = &acts[probs_off..probs_off + n * v];
+    dlogits
+        .par_chunks_mut(v)
+        .zip(probs.par_chunks(v))
+        .enumerate()
+        .for_each(|(r, (drow, prow))| {
+            let ix = targets[r] as usize;
+            for j in 0..v {
+                let ind = if j == ix { F::one() } else { F::zero() };
+                drow[j] = drow[j] + (prow[j] - ind) * dmean;
+            }
+        });
 }
 
 /// Backward of the `[OC, C]` linear. Accumulates into `dinp`, `dweight`, `dbias`
@@ -1001,22 +1048,27 @@ fn layernorm_backward<F: Float>(
 }
 
 /// Backward of tanh-GELU. Accumulates `dinp`.
-fn gelu_backward<F: Float>(gacts: &mut [F], dinp_off: usize, dout_off: usize, acts: &[F], inp_off: usize, n: usize) {
+fn gelu_backward<F: Float + Send + Sync>(gacts: &mut [F], dinp_off: usize, dout_off: usize, acts: &[F], inp_off: usize, n: usize) {
     let s = cast::<F>(GELU_SCALE);
     let half = cast::<F>(0.5);
     let a = cast::<F>(0.044715);
     let three_a = cast::<F>(3.0 * 0.044715);
-    for i in 0..n {
-        let x = acts[inp_off + i];
-        let cube = a * x * x * x;
-        let arg = s * (x + cube);
-        let tanh_out = arg.tanh();
-        let cosh = arg.cosh();
-        let sech2 = F::one() / (cosh * cosh);
-        let local =
-            half * (F::one() + tanh_out) + x * half * sech2 * s * (F::one() + three_a * x * x);
-        gacts[dinp_off + i] = gacts[dinp_off + i] + local * gacts[dout_off + i];
-    }
+    let inp = &acts[inp_off..inp_off + n];
+    // arena order: dinp(fch) < dout(fch_gelu)
+    let (dinp, dout) = disjoint_mut(gacts, dinp_off, n, dout_off, n);
+    dinp.par_iter_mut()
+        .zip(dout.par_iter())
+        .zip(inp.par_iter())
+        .for_each(|((di, &dou), &x)| {
+            let cube = a * x * x * x;
+            let arg = s * (x + cube);
+            let tanh_out = arg.tanh();
+            let cosh = arg.cosh();
+            let sech2 = F::one() / (cosh * cosh);
+            let local =
+                half * (F::one() + tanh_out) + x * half * sech2 * s * (F::one() + three_a * x * x);
+            *di = *di + local * dou;
+        });
 }
 
 /// Backward of a residual add: both inputs get the upstream gradient.
@@ -1030,7 +1082,7 @@ fn residual_backward<F: Float>(gacts: &mut [F], dinp1_off: usize, dinp2_off: usi
 
 /// Backward of causal multi-head attention. Accumulates `dinp` (dqkv), using
 /// `dpreatt`/`datt` as scratch. `inp`/`att` are the cached forward values.
-fn attention_backward<F: Float>(
+fn attention_backward<F: Float + Send + Sync>(
     gacts: &mut [F],
     dinp_off: usize,
     dpreatt_off: usize,
@@ -1047,49 +1099,66 @@ fn attention_backward<F: Float>(
     let hs = c / nh;
     let scale = F::one() / cast::<F>(hs as f64).sqrt();
     let c3 = 3 * c;
-    for bi in 0..b {
-        for h in 0..nh {
-            for ti in 0..t {
-                let att_base = att_off + ((bi * nh + h) * t + ti) * t;
-                let datt_base = datt_off + ((bi * nh + h) * t + ti) * t;
-                let dpreatt_base = dpreatt_off + ((bi * nh + h) * t + ti) * t;
-                let dout_base = dout_off + (bi * t + ti) * c + h * hs;
+    // Same batch-parallel split as the forward; `acts` is read-only/shared.
+    // Gradient-arena order mirrors the forward arena: dinp(qkv) < dout(atty) <
+    // dpreatt < datt.
+    let (dinp, dout, dpreatt, datt) = four_disjoint_mut(
+        gacts,
+        dinp_off, b * t * c3,
+        dout_off, b * t * c,
+        dpreatt_off, b * nh * t * t,
+        datt_off, b * nh * t * t,
+    );
+    dinp.par_chunks_mut(t * c3)
+        .zip(dout.par_chunks_mut(t * c))
+        .zip(dpreatt.par_chunks_mut(nh * t * t))
+        .zip(datt.par_chunks_mut(nh * t * t))
+        .enumerate()
+        .for_each(|(bi, (((dinp_b, dout_b), dpreatt_b), datt_b))| {
+            let att_bi = att_off + bi * nh * t * t;
+            let inp_bi = inp_off + bi * t * c3;
+            for h in 0..nh {
+                for ti in 0..t {
+                    let att_base = att_bi + (h * t + ti) * t;
+                    let datt_base = (h * t + ti) * t;
+                    let dpreatt_base = datt_base;
+                    let dout_base = ti * c + h * hs;
 
-                // backward through the value accumulation -> datt and dvalue
-                for t2 in 0..=ti {
-                    let v_base = inp_off + (bi * t + t2) * c3 + 2 * c + h * hs;
-                    let dv_base = dinp_off + (bi * t + t2) * c3 + 2 * c + h * hs;
-                    for i in 0..hs {
-                        gacts[datt_base + t2] =
-                            gacts[datt_base + t2] + acts[v_base + i] * gacts[dout_base + i];
-                        gacts[dv_base + i] =
-                            gacts[dv_base + i] + acts[att_base + t2] * gacts[dout_base + i];
+                    // backward through the value accumulation -> datt and dvalue
+                    for t2 in 0..=ti {
+                        let v_base = inp_bi + t2 * c3 + 2 * c + h * hs;
+                        let dv_base = t2 * c3 + 2 * c + h * hs;
+                        for i in 0..hs {
+                            datt_b[datt_base + t2] =
+                                datt_b[datt_base + t2] + acts[v_base + i] * dout_b[dout_base + i];
+                            dinp_b[dv_base + i] =
+                                dinp_b[dv_base + i] + acts[att_base + t2] * dout_b[dout_base + i];
+                        }
                     }
-                }
-                // backward through the softmax: dpreatt = (diag(att) - att att^T) datt
-                for t2 in 0..=ti {
-                    for t3 in 0..=ti {
-                        let ind = if t2 == t3 { F::one() } else { F::zero() };
-                        let local = acts[att_base + t2] * (ind - acts[att_base + t3]);
-                        gacts[dpreatt_base + t3] =
-                            gacts[dpreatt_base + t3] + local * gacts[datt_base + t2];
+                    // backward through the softmax: dpreatt = (diag(att) - att att^T) datt
+                    for t2 in 0..=ti {
+                        for t3 in 0..=ti {
+                            let ind = if t2 == t3 { F::one() } else { F::zero() };
+                            let local = acts[att_base + t2] * (ind - acts[att_base + t3]);
+                            dpreatt_b[dpreatt_base + t3] =
+                                dpreatt_b[dpreatt_base + t3] + local * datt_b[datt_base + t2];
+                        }
                     }
-                }
-                // backward through the scaled dot product -> dquery, dkey
-                for t2 in 0..=ti {
-                    let q_base = inp_off + (bi * t + ti) * c3 + h * hs;
-                    let dq_base = dinp_off + (bi * t + ti) * c3 + h * hs;
-                    let k_base = inp_off + (bi * t + t2) * c3 + c + h * hs;
-                    let dk_base = dinp_off + (bi * t + t2) * c3 + c + h * hs;
-                    let dpre = gacts[dpreatt_base + t2] * scale;
-                    for i in 0..hs {
-                        gacts[dq_base + i] = gacts[dq_base + i] + acts[k_base + i] * dpre;
-                        gacts[dk_base + i] = gacts[dk_base + i] + acts[q_base + i] * dpre;
+                    // backward through the scaled dot product -> dquery, dkey
+                    for t2 in 0..=ti {
+                        let q_base = inp_bi + ti * c3 + h * hs;
+                        let dq_base = ti * c3 + h * hs;
+                        let k_base = inp_bi + t2 * c3 + c + h * hs;
+                        let dk_base = t2 * c3 + c + h * hs;
+                        let dpre = dpreatt_b[dpreatt_base + t2] * scale;
+                        for i in 0..hs {
+                            dinp_b[dq_base + i] = dinp_b[dq_base + i] + acts[k_base + i] * dpre;
+                            dinp_b[dk_base + i] = dinp_b[dk_base + i] + acts[q_base + i] * dpre;
+                        }
                     }
                 }
             }
-        }
-    }
+        });
 }
 
 /// Backward of the encoder: scatter-add into `dwte` (by token id) and `dwpe`.
