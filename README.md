@@ -2,7 +2,6 @@
 
 <img src="giordano_forge.png" alt="Hephaistos — the forge" width="320"/>
 
-<p align="center"><sub><sub>Luca Giordano's <i>The Forge of Vulcan</i>, rendered with <a href="https://github.com/Tsuskov/ren-ascii-sance">ren-ascii-sance</a></sub></sub></p>
 
 # Hephaistos
 
