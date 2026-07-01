@@ -14,6 +14,7 @@ mod train;
 
 use std::path::Path;
 
+use cadmus::BpeModel;
 use data::{encode_ids, train_bpe, write_u16_le, DataLoader};
 use model::{Config, Gpt};
 
@@ -71,20 +72,20 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Phase 1: tokenizer (train once, then reuse the saved one).
     let tok = if Path::new(TOK_PATH).exists() {
         println!("loading tokenizer from {TOK_PATH}");
-        tokenizers::Tokenizer::from_file(TOK_PATH)?
+        BpeModel::from_hf_json(&std::fs::read_to_string(TOK_PATH)?)?
     } else {
         println!("training byte-level BPE (vocab={VOCAB_SIZE}) on {CORPUS} ...");
         train_bpe(CORPUS, TOK_PATH, VOCAB_SIZE)?
     };
-    println!("vocab size = {}", tok.get_vocab_size(true));
+    println!("vocab size = {}", tok.vocab_size());
 
     // Encode corpus -> train/val bins (once).
     if !(Path::new(TRAIN_BIN).exists() && Path::new(VAL_BIN).exists()) {
         let text = std::fs::read_to_string(CORPUS)?;
         let split = text.len() * 9 / 10; // tinyshakespeare is ASCII -> byte split is safe
         let (train_text, val_text) = text.split_at(split);
-        let train_ids = encode_ids(&tok, train_text)?;
-        let val_ids = encode_ids(&tok, val_text)?;
+        let train_ids = encode_ids(&tok, train_text);
+        let val_ids = encode_ids(&tok, val_text);
         write_u16_le(TRAIN_BIN, &train_ids)?;
         write_u16_le(VAL_BIN, &val_ids)?;
         println!("wrote {} train + {} val tokens", train_ids.len(), val_ids.len());
@@ -98,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("batch x,y each = [{BATCH_SIZE}, {BLOCK_SIZE}] = {} tokens", x.len());
 
     let row0: Vec<u32> = x[0..BLOCK_SIZE].iter().map(|&t| t as u32).collect();
-    let decoded = tok.decode(&row0, false)?;
+    let decoded = tok.decode(&row0);
     println!("\n--- decoded batch row 0 ---\n{decoded}\n---------------------------");
 
     // Within a row, targets are inputs shifted left by one.
@@ -144,7 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .max_by(|a, b| a.1.total_cmp(b.1))
         .map(|(i, _)| i as u32)
         .unwrap();
-    let pred = tok.decode(&[argmax], false)?;
+    let pred = tok.decode(&[argmax]);
     println!("untrained next-token prediction (row 0): id {argmax} = {pred:?}");
 
     // Phase 3: untrained loss should sit near ln(vocab_size) (uniform-guess).
@@ -213,8 +214,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let seed = &seed_batch[0..BLOCK_SIZE]; // a real contiguous snippet
     let generated = sample::generate(&mut sample_model, seed, 200, 0.8, Some(40), &mut rng);
 
-    let seed_txt = tok.decode(&seed.iter().map(|&t| t as u32).collect::<Vec<_>>(), false)?;
-    let gen_txt = tok.decode(&generated.iter().map(|&t| t as u32).collect::<Vec<_>>(), false)?;
+    let seed_txt = tok.decode(&seed.iter().map(|&t| t as u32).collect::<Vec<_>>());
+    let gen_txt = tok.decode(&generated.iter().map(|&t| t as u32).collect::<Vec<_>>());
     println!("\nPhase 7 sample (temperature 0.8, top-k 40):");
     println!("--- seed ---\n{seed_txt}");
     println!("--- generated ---\n{gen_txt}");
@@ -235,13 +236,13 @@ fn phase8() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     const GREEK_VAL: &str = "data/greek_val.bin";
     const GREEK_CKPT: &str = "data/greek_ckpt.bin";
 
-    let tok = tokenizers::Tokenizer::from_file(GREEK_TOK)?;
-    println!("Phase 8: Greek run | tokenizer vocab = {}", tok.get_vocab_size(true));
+    let tok = BpeModel::from_hf_json(&std::fs::read_to_string(GREEK_TOK)?)?;
+    println!("Phase 8: Greek run | tokenizer vocab = {}", tok.vocab_size());
 
     // Encode the whole corpus, then split tokens 90/10 (matches the reference).
     if !(Path::new(GREEK_TRAIN).exists() && Path::new(GREEK_VAL).exists()) {
         let text = std::fs::read_to_string(GREEK_CORPUS)?;
-        let ids = encode_ids(&tok, &text)?;
+        let ids = encode_ids(&tok, &text);
         let split = ids.len() * 9 / 10;
         write_u16_le(GREEK_TRAIN, &ids[..split])?;
         write_u16_le(GREEK_VAL, &ids[split..])?;

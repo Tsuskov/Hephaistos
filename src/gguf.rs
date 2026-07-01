@@ -225,3 +225,22 @@ pub fn add_byte_bpe_tokenizer(w: &mut GgufWriter, tokenizer_path: &str) -> std::
     w.kv_bool("tokenizer.ggml.add_bos_token", false);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cadmus::BpeModel;
+
+    /// A `tokenizer.json` written by Cadmus must be accepted by this parser —
+    /// i.e. Cadmus is a real drop-in for the tokenizer the GGUF writer reads.
+    #[test]
+    fn parses_a_cadmus_written_tokenizer() {
+        let model = BpeModel::train("the cat sat on the mat. the cat ran fast.", 320, 2);
+        let path = std::env::temp_dir().join("cadmus_gguf_test.json");
+        std::fs::write(&path, model.to_hf_json()).unwrap();
+
+        let mut w = GgufWriter::new();
+        add_byte_bpe_tokenizer(&mut w, path.to_str().unwrap())
+            .expect("gguf.rs must parse a Cadmus tokenizer.json");
+    }
+}

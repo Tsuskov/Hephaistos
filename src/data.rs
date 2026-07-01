@@ -1,50 +1,28 @@
 //! Phase 1 — data & tokenizer.
 //!
-//! Train a fresh byte-level BPE on the corpus, dump token ids as flat `u16`
-//! binaries, and hand out random `[B, T]` batches.
+//! Train a fresh byte-level BPE on the corpus (via the from-scratch `cadmus`
+//! crate), dump token ids as flat `u16` binaries, and hand out random `[B, T]`
+//! batches.
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufWriter, Read, Write};
 
+use cadmus::BpeModel;
 use rand::Rng;
-use tokenizers::models::bpe::{BpeTrainerBuilder, BPE};
-use tokenizers::pre_tokenizers::byte_level::ByteLevel;
-use tokenizers::{NormalizerWrapper, Tokenizer, TokenizerBuilder, TokenizerImpl};
 
-/// Train a byte-level BPE on `corpus_path`, save it to `out_path`, and return
-/// it as a type-erased `Tokenizer` ready for encode/decode.
-pub fn train_bpe(
-    corpus_path: &str,
-    out_path: &str,
-    vocab_size: usize,
-) -> tokenizers::Result<Tokenizer> {
-    let mut trainer = BpeTrainerBuilder::new()
-        .show_progress(false)
-        .vocab_size(vocab_size)
-        .min_frequency(2)
-        // Seed all 256 byte-level chars so nothing is ever <unk>.
-        .initial_alphabet(ByteLevel::alphabet().into_iter().collect())
-        .build();
-
-    let mut tokenizer: TokenizerImpl<BPE, NormalizerWrapper, ByteLevel, ByteLevel, ByteLevel> =
-        TokenizerBuilder::new()
-            .with_model(BPE::default())
-            .with_normalizer(None)
-            .with_pre_tokenizer(Some(ByteLevel::default()))
-            .with_post_processor(Some(ByteLevel::default()))
-            .with_decoder(Some(ByteLevel::default()))
-            .build()?;
-
-    tokenizer.train_from_files(&mut trainer, vec![corpus_path.to_string()])?;
-    tokenizer.save(out_path, true)?;
-
-    Tokenizer::from_file(out_path)
+/// Train a byte-level BPE on `corpus_path`, save it as an HF `tokenizer.json`
+/// (the shape `gguf.rs` reads) to `out_path`, and return the model ready for
+/// encode/decode.
+pub fn train_bpe(corpus_path: &str, out_path: &str, vocab_size: usize) -> std::io::Result<BpeModel> {
+    let text = fs::read_to_string(corpus_path)?;
+    let model = BpeModel::train(&text, vocab_size, 2);
+    fs::write(out_path, model.to_hf_json())?;
+    Ok(model)
 }
 
 /// Encode `text` to a flat `u16` id stream (vocab fits in u16 for our configs).
-pub fn encode_ids(tok: &Tokenizer, text: &str) -> tokenizers::Result<Vec<u16>> {
-    let enc = tok.encode(text, false)?;
-    Ok(enc.get_ids().iter().map(|&id| id as u16).collect())
+pub fn encode_ids(tok: &BpeModel, text: &str) -> Vec<u16> {
+    tok.encode(text).iter().map(|&id| id as u16).collect()
 }
 
 /// Write ids as little-endian `u16` bytes.
