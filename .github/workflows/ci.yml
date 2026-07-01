@@ -15,6 +15,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Cadmus is a sibling path dependency (`../Cadmus`); clone it next to this
+      # checkout so cargo can resolve it.
+      - name: Check out Cadmus (path dependency)
+        run: git clone --depth 1 https://github.com/Tsuskov/Cadmus.git ../Cadmus
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 

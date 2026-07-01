@@ -1,8 +1,13 @@
 //! Verifies the Cadmus drop-in against the *real* artifacts on disk: it must
 //! load the HF `tokenizer.json` files that the old `tokenizers` crate wrote, and
 //! decode the existing HF-encoded `.bin` streams back into readable text.
+//!
+//! The `data/` dir is git-ignored, so these artifacts only exist locally — each
+//! pair is skipped when absent (e.g. in CI). The self-contained proof that
+//! `gguf.rs` accepts a Cadmus-written tokenizer lives in a unit test in gguf.rs.
 
 use std::fs;
+use std::path::Path;
 
 use cadmus::BpeModel;
 
@@ -16,6 +21,10 @@ fn loads_hf_tokenizers_and_decodes_existing_bins() {
     for (tok_path, bin_path) in
         [("data/tokenizer.json", "data/train.bin"), ("data/greek_tokenizer.json", "data/greek_train.bin")]
     {
+        if !(Path::new(tok_path).exists() && Path::new(bin_path).exists()) {
+            eprintln!("skipping {tok_path}: artifact not present (git-ignored)");
+            continue;
+        }
         let json = fs::read_to_string(tok_path).unwrap();
         let tok = BpeModel::from_hf_json(&json).expect("cadmus loads HF tokenizer.json");
         assert!(tok.vocab_size() > 256, "{tok_path}: vocab should have learned merges");
